@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
+    Queued,
     Downloading,
     Complete,
     Paused,
@@ -16,6 +17,7 @@ pub enum Status {
 impl Status {
     pub fn label(self) -> &'static str {
         match self {
+            Status::Queued => "Queued",
             Status::Downloading => "Downloading",
             Status::Complete => "Complete",
             Status::Paused => "Stopped",
@@ -112,6 +114,32 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             category,
         });
     }
+}
+
+/// Tambahkan baris berstatus Queued (Download Later).
+pub fn on_queued(id: u64, url: String, output: PathBuf) {
+    let mut rows = ROWS.lock().unwrap();
+    if rows.iter().any(|r| r.id == id) {
+        return;
+    }
+    let name = output
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let category = Category::from_filename(&name);
+    rows.push(Row {
+        id,
+        url,
+        output,
+        name,
+        size: None,
+        downloaded: 0,
+        speed_bps: 0,
+        status: Status::Queued,
+        segments: Vec::new(),
+        complete_announced: false,
+        category,
+    });
 }
 
 /// Baris yang baru selesai & belum ditampilkan dialog "Download complete";

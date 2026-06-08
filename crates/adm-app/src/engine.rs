@@ -1,24 +1,27 @@
-//! Manajer engine in-process (plan §4). Membungkus `adm-core` di runtime
-//! tokio bersama; tiap unduhan = task dengan `CancelToken` (untuk pause/stop,
-//! per-item maupun all). Event lifecycle dialirkan lewat `EventSink`.
+//! Manajer engine in-process (plan §4) + antrian (§9.4/§10, WM6).
+//!
+//! Tiap unduhan = task tokio dengan `CancelToken`. Antrian menahan unduhan
+//! "Download Later" dan menjalankannya hingga `max` konkuren; saat satu selesai,
+//! slot terisi item berikutnya (`pump`).
 
+use crate::category::Category;
 use adm_core::{download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb};
 use adm_ipc::DownloadAddParams;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
+    Queued { id: u64, url: String, output: PathBuf },
     Started { id: u64, url: String, output: PathBuf },
     Progress {
         id: u64,
         downloaded: u64,
         total: Option<u64>,
         speed_bps: u64,
-        /// (start, end, downloaded) per segmen.
         segments: Vec<(u64, u64, u64)>,
     },
     Completed { id: u64, bytes: u64 },
@@ -28,6 +31,13 @@ pub enum EngineEvent {
 
 pub type EventSink = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
+struct QueueState {
+    running: bool,
+    max: usize,
+    pending: VecDeque<(u64, DownloadAddParams)>,
+    running_ids: HashSet<u64>,
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     handle: Handle,
@@ -35,6 +45,7 @@ pub struct EngineHandle {
     sink: EventSink,
     active: Arc<Mutex<HashMap<u64, CancelToken>>>,
     next_id: Arc<AtomicU64>,
+    queue: Arc<Mutex<QueueState>>,
 }
 
 impl EngineHandle {
@@ -45,10 +56,16 @@ impl EngineHandle {
             sink,
             active: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::new(Mutex::new(QueueState {
+                running: false,
+                max: 1,
+                pending: VecDeque::new(),
+                running_ids: HashSet::new(),
+            })),
         }
     }
 
-    pub fn download_dir(&self) -> &std::path::Path {
+    pub fn download_dir(&self) -> &Path {
         &self.download_dir
     }
 
@@ -56,47 +73,101 @@ impl EngineHandle {
         self.active.lock().unwrap().len()
     }
 
-    /// Batalkan satu unduhan (sidecar tetap → resumable).
+    /// Batas unduhan antrian yang berjalan bersamaan.
+    pub fn set_queue_max(&self, max: usize) {
+        self.queue.lock().unwrap().max = max.max(1);
+    }
+
     pub fn cancel(&self, id: u64) {
         if let Some(t) = self.active.lock().unwrap().get(&id) {
             t.cancel();
         }
     }
 
-    /// Batalkan semua (Pause/Stop All).
     pub fn cancel_all(&self) {
         for t in self.active.lock().unwrap().values() {
             t.cancel();
         }
     }
 
-    /// Tambah unduhan baru; kembalikan id.
+    /// Tambah & mulai segera; kembalikan id.
     pub fn add(&self, params: DownloadAddParams) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.start(id, params);
+        self.start(id, params, false);
         id
     }
 
-    /// Lanjutkan unduhan yang sudah ada (id dipakai ulang → baris tak duplikat).
+    /// Lanjutkan unduhan yang sudah ada (segera).
     pub fn resume(&self, id: u64, url: String, filename: String) {
         self.start(
             id,
-            DownloadAddParams {
-                url,
-                filename: Some(filename),
-                ..Default::default()
-            },
+            DownloadAddParams { url, filename: Some(filename), ..Default::default() },
+            false,
         );
     }
 
-    fn start(&self, id: u64, params: DownloadAddParams) {
-        let filename = pick_filename(&params, id);
-        // Auto-kategori → subfolder (plan §10).
+    /// Tambahkan ke antrian ("Download Later"); jalan saat queue running & ada slot.
+    pub fn enqueue(&self, params: DownloadAddParams) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let output = self.output_for(&params, id);
+        (self.sink)(EngineEvent::Queued { id, url: params.url.clone(), output });
+        self.queue.lock().unwrap().pending.push_back((id, params));
+        self.pump();
+        id
+    }
+
+    /// Mulai antrian (Start Queue).
+    pub fn start_queue(&self) {
+        self.queue.lock().unwrap().running = true;
+        self.pump();
+    }
+
+    /// Hentikan antrian (Stop Queue): batalkan item antrian yang sedang jalan.
+    pub fn stop_queue(&self) {
+        let ids: Vec<u64> = {
+            let mut q = self.queue.lock().unwrap();
+            q.running = false;
+            q.running_ids.iter().copied().collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+    }
+
+    /// Jalankan item pending hingga batas konkuren tercapai.
+    fn pump(&self) {
+        loop {
+            let next = {
+                let mut q = self.queue.lock().unwrap();
+                if !q.running || q.running_ids.len() >= q.max {
+                    break;
+                }
+                match q.pending.pop_front() {
+                    Some((id, params)) => {
+                        q.running_ids.insert(id);
+                        Some((id, params))
+                    }
+                    None => None,
+                }
+            };
+            match next {
+                Some((id, params)) => self.start(id, params, true),
+                None => break,
+            }
+        }
+    }
+
+    fn output_for(&self, params: &DownloadAddParams, id: u64) -> PathBuf {
+        let filename = pick_filename(params, id);
         let mut dir = self.download_dir.clone();
-        if let Some(folder) = crate::category::Category::from_filename(&filename).folder() {
+        if let Some(folder) = Category::from_filename(&filename).folder() {
             dir.push(folder);
         }
-        let output = dir.join(filename);
+        dir.join(filename)
+    }
+
+    fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
+        let output = self.output_for(&params, id);
         let cancel = CancelToken::new();
         self.active.lock().unwrap().insert(id, cancel.clone());
 
@@ -107,21 +178,13 @@ impl EngineHandle {
             speed_limit_bps: None,
         };
 
-        (self.sink)(EngineEvent::Started {
-            id,
-            url: params.url.clone(),
-            output,
-        });
+        (self.sink)(EngineEvent::Started { id, url: params.url.clone(), output });
 
         let sink = self.sink.clone();
         let active = self.active.clone();
         let prog = sink.clone();
         let on_progress: ProgressCb = Arc::new(move |p: Progress| {
-            let segments = p
-                .segments
-                .iter()
-                .map(|s| (s.start, s.end, s.downloaded))
-                .collect();
+            let segments = p.segments.iter().map(|s| (s.start, s.end, s.downloaded)).collect();
             prog(EngineEvent::Progress {
                 id,
                 downloaded: p.downloaded,
@@ -131,15 +194,22 @@ impl EngineHandle {
             });
         });
 
+        let this = self.clone();
         self.handle.spawn(async move {
             let res = download(req, cancel, Some(on_progress)).await;
             active.lock().unwrap().remove(&id);
+            // Emit event terminal DULU (slot dianggap selesai) sebelum memulai
+            // item antrian berikutnya — agar pengamat tak melihat konkuren palsu.
             let ev = match res {
                 Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
                 Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
                 Err(e) => EngineEvent::Failed { id, error: e.to_string() },
             };
             sink(ev);
+            if queued {
+                this.queue.lock().unwrap().running_ids.remove(&id);
+                this.pump();
+            }
         });
     }
 }

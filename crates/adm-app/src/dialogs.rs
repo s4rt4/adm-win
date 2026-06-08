@@ -15,9 +15,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const IDOK: usize = 1;
 const IDCANCEL: usize = 2;
+const IDLATER: usize = 3;
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
+static START_NOW: AtomicBool = AtomicBool::new(true);
 static RESULT: Mutex<Option<DownloadAddParams>> = Mutex::new(None);
 // HWND edit (sebagai isize) — dialog modal tunggal, jadi global aman.
 static URL_EDIT: Mutex<isize> = Mutex::new(0);
@@ -88,7 +90,11 @@ fn read_text(slot: &Mutex<isize>) -> String {
 }
 
 /// Tampilkan dialog Add modal. Mengembalikan params bila user menekan Start.
-pub fn add_dialog(parent: HWND, default_url: &str, download_dir: &Path) -> Option<DownloadAddParams> {
+pub fn add_dialog(
+    parent: HWND,
+    default_url: &str,
+    download_dir: &Path,
+) -> Option<(DownloadAddParams, bool)> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None).ok()?.into();
 
@@ -169,14 +175,19 @@ pub fn add_dialog(parent: HWND, default_url: &str, download_dir: &Path) -> Optio
         let _ = SetWindowTextW(save, PCWSTR(h.as_ptr()));
 
         let _ = make_child(
+            dlg, w!("BUTTON"), w!("Download Later"),
+            WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+            120, 160, 120, 30, IDLATER, instance,
+        );
+        let _ = make_child(
             dlg, w!("BUTTON"), w!("Start Download"),
             WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32),
-            190, 160, 140, 30, IDOK, instance,
+            250, 160, 140, 30, IDOK, instance,
         );
         let _ = make_child(
             dlg, w!("BUTTON"), w!("Cancel"),
             WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-            346, 160, 100, 30, IDCANCEL, instance,
+            400, 160, 100, 30, IDCANCEL, instance,
         );
 
         let _ = EnableWindow(parent, false);
@@ -198,7 +209,11 @@ pub fn add_dialog(parent: HWND, default_url: &str, download_dir: &Path) -> Optio
             let _ = DestroyWindow(dlg);
         }
 
-        RESULT.lock().unwrap().take()
+        RESULT
+            .lock()
+            .unwrap()
+            .take()
+            .map(|p| (p, START_NOW.load(Ordering::SeqCst)))
     }
 }
 
@@ -208,7 +223,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
-                    IDOK => {
+                    IDOK | IDLATER => {
                         let url = read_text(&URL_EDIT);
                         if !url.trim().is_empty() {
                             let save = read_text(&SAVE_EDIT);
@@ -222,6 +237,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                 filename,
                                 ..Default::default()
                             });
+                            START_NOW.store(id == IDOK, Ordering::SeqCst);
                         }
                         DONE.store(true, Ordering::SeqCst);
                         let _ = DestroyWindow(hwnd);

@@ -528,6 +528,7 @@ pub fn show_complete(parent: HWND, row: &Row) {
 
 fn status_line(r: &Row) -> String {
     match r.status {
+        Status::Queued => "Queued".into(),
         Status::Downloading => "Receiving data...".into(),
         Status::Complete => "Complete".into(),
         Status::Paused => "Stopped".into(),

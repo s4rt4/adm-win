@@ -127,6 +127,9 @@ pub fn engine() -> Option<EngineHandle> {
 pub fn make_sink() -> EventSink {
     Arc::new(|ev: EngineEvent| {
         match ev {
+            EngineEvent::Queued { id, url, output } => {
+                store::on_queued(id, url, output);
+            }
             EngineEvent::Started { id, url, output } => {
                 eprintln!("[engine] #{id} mulai -> {}", output.display());
                 store::on_started(id, url, output);
@@ -289,7 +292,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     )
     .unwrap_or_default();
     SendMessageW(tb, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
-    SendMessageW(tb, TB_SETEXTENDEDSTYLE, Some(WPARAM(0)), Some(LPARAM(TBSTYLE_EX_MIXEDBUTTONS as isize)));
+    SendMessageW(tb, TB_SETEXTENDEDSTYLE, Some(WPARAM(0)), Some(LPARAM((TBSTYLE_EX_MIXEDBUTTONS | TBSTYLE_EX_DRAWDDARROWS) as isize)));
     let himl = build_toolbar_imagelist();
     SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
     add_toolbar_buttons(tb);
@@ -477,7 +480,7 @@ fn mkbtn(buttons: &mut Vec<TBBUTTON>, id: usize, label: &str, icon: i32, dropdow
     let ptr = Box::leak(wide.into_boxed_slice()).as_ptr() as isize;
     let mut style: u32 = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
     if dropdown {
-        style |= BTNS_WHOLEDROPDOWN;
+        style |= BTNS_DROPDOWN; // klik tombol = aksi; panah = TBN_DROPDOWN
     }
     buttons.push(TBBUTTON {
         iBitmap: icon,
@@ -789,7 +792,18 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_SCHEDULER => info(hwnd, "Scheduler menyusul (WM6)."),
         ID_OPTIONS => info(hwnd, "Options menyusul (WM7)."),
         ID_SPEED_LIMITER => info(hwnd, "Speed Limiter UI menyusul (WM6)."),
-        ID_START_QUEUE | ID_STOP_QUEUE => info(hwnd, "Antrian menyusul (WM6)."),
+        ID_START_QUEUE => {
+            if let Some(e) = ENGINE.get() {
+                e.start_queue();
+            }
+            refresh_ui(hwnd);
+        }
+        ID_STOP_QUEUE => {
+            if let Some(e) = ENGINE.get() {
+                e.stop_queue();
+            }
+            refresh_ui(hwnd);
+        }
         ID_FIND | ID_FIND_NEXT => info(hwnd, "Find menyusul."),
         ID_ADD_BATCH | ID_ADD_BATCH_CLIP => info(hwnd, "Batch download menyusul."),
         ID_SITE_GRABBER => info(hwnd, "Site grabber = fase lanjutan."),
@@ -811,8 +825,12 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
 
 unsafe fn do_add(hwnd: HWND) {
     let Some(engine) = ENGINE.get() else { return };
-    if let Some(params) = dialogs::add_dialog(hwnd, "", engine.download_dir()) {
-        engine.add(params);
+    if let Some((params, start_now)) = dialogs::add_dialog(hwnd, "", engine.download_dir()) {
+        if start_now {
+            engine.add(params);
+        } else {
+            engine.enqueue(params);
+        }
         refresh_ui(hwnd);
     }
 }

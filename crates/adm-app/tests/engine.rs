@@ -175,3 +175,46 @@ async fn routes_by_category() {
     let expected = dir.path().join("Compressed").join("pkg.zip");
     assert!(expected.exists(), "berkas .zip harus di subfolder Compressed: {}", expected.display());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_respects_max() {
+    let payload = Arc::new(make_payload(128 * 1024));
+    let (base, _srv) = start_server(payload.clone());
+    let dir = tempfile::tempdir().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    let sink: EventSink = Arc::new(move |ev| {
+        let _ = tx.send(ev);
+    });
+    let engine = EngineHandle::new(tokio::runtime::Handle::current(), dir.path().to_path_buf(), sink);
+    engine.set_queue_max(1); // strictly sequential
+
+    for i in 0..3 {
+        engine.enqueue(DownloadAddParams {
+            url: format!("{base}/f{i}.bin"),
+            filename: Some(format!("f{i}.bin")),
+            ..Default::default()
+        });
+    }
+    engine.start_queue();
+
+    let mut active = 0i32;
+    let mut peak = 0i32;
+    let mut completed = 0;
+    while completed < 3 {
+        match rx.recv().await.unwrap() {
+            EngineEvent::Started { .. } => {
+                active += 1;
+                peak = peak.max(active);
+            }
+            EngineEvent::Completed { .. } => {
+                active -= 1;
+                completed += 1;
+            }
+            EngineEvent::Failed { error, .. } => panic!("gagal: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 3, "ketiga unduhan antrian harus selesai");
+    assert!(peak <= 1, "konkuren melebihi batas (max=1): {peak}");
+}
