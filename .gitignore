@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb
+
+# Dokumen perencanaan internal — tidak ikut repo (lokal saja).
+ADM_Windows_Implementation_Plan.md
