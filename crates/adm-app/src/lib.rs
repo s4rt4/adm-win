@@ -30,6 +30,9 @@ fn default_download_dir() -> PathBuf {
 
 /// Entry point aplikasi.
 pub fn run() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[PANIC] {info}");
+    }));
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Mode CLI autostart (untuk Options/test; toggle utama via tray).

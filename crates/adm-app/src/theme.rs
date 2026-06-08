@@ -1,6 +1,5 @@
 //! Resolusi tema (plan §12). System dibaca dari registry Windows.
 
-use crate::settings::{THEME_DARK, THEME_LIGHT};
 use windows::core::{w, PCSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -10,6 +9,7 @@ use windows::Win32::System::Registry::{
 };
 
 /// Apakah Windows sedang memakai tema gelap (AppsUseLightTheme == 0).
+#[allow(dead_code)] // dipakai lagi saat dark mode dirombak
 pub fn system_is_dark() -> bool {
     unsafe {
         let mut hkey = HKEY::default();
@@ -60,11 +60,8 @@ pub fn set_dark_menus(dark: bool) {
     }
 }
 
-/// Tema efektif (resolve System → terang/gelap aktual).
-pub fn effective_dark(theme_setting: u8) -> bool {
-    match theme_setting {
-        THEME_DARK => true,
-        THEME_LIGHT => false,
-        _ => system_is_dark(), // System
-    }
+/// Tema efektif. **Dark mode dinonaktifkan sementara** (rendering bermasalah —
+/// akan dirombak nanti); selalu Light agar UI stabil.
+pub fn effective_dark(_theme_setting: u8) -> bool {
+    false
 }
