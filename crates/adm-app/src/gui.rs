@@ -935,150 +935,37 @@ fn fmt_eta(secs: Option<u64>) -> String {
     }
 }
 
-// ============================ Toolbar icons (GDI) ============================
+// ============================ Toolbar icons ============================
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
-}
+/// Blob ikon toolbar (11 × 24×24 premultiplied BGRA) dari tools/icongen.
+const TB_ICONS: &[u8] = include_bytes!("../assets/icons/toolbar24.bin");
 
-const GREEN: (u8, u8, u8) = (40, 160, 70);
-const DGREEN: (u8, u8, u8) = (59, 91, 67);
-const RED: (u8, u8, u8) = (210, 60, 55);
-const GOLD: (u8, u8, u8) = (217, 180, 4);
-const GRAY: (u8, u8, u8) = (96, 96, 100);
-const BLUE: (u8, u8, u8) = (70, 130, 180);
-const WHITE: (u8, u8, u8) = (255, 255, 255);
-
-unsafe fn frect(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: (u8, u8, u8)) {
-    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
-    let rc = RECT { left: l, top: t, right: r, bottom: b };
-    FillRect(dc, &rc, br);
-    let _ = DeleteObject(br.into());
-}
-
-unsafe fn fellipse(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: (u8, u8, u8)) {
-    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
-    let pen = CreatePen(PS_SOLID, 1, rgb(c.0, c.1, c.2));
-    let ob = SelectObject(dc, br.into());
-    let op = SelectObject(dc, pen.into());
-    let _ = Ellipse(dc, l, t, r, b);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    let _ = DeleteObject(br.into());
-    let _ = DeleteObject(pen.into());
-}
-
-unsafe fn line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, w: i32, c: (u8, u8, u8)) {
-    let pen = CreatePen(PS_SOLID, w, rgb(c.0, c.1, c.2));
-    let op = SelectObject(dc, pen.into());
-    let _ = MoveToEx(dc, x1, y1, None);
-    let _ = LineTo(dc, x2, y2);
-    SelectObject(dc, op);
-    let _ = DeleteObject(pen.into());
-}
-
-unsafe fn tri(dc: HDC, pts: [(i32, i32); 3], c: (u8, u8, u8)) {
-    let p: [POINT; 3] = [
-        POINT { x: pts[0].0, y: pts[0].1 },
-        POINT { x: pts[1].0, y: pts[1].1 },
-        POINT { x: pts[2].0, y: pts[2].1 },
-    ];
-    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
-    let pen = CreatePen(PS_SOLID, 1, rgb(c.0, c.1, c.2));
-    let ob = SelectObject(dc, br.into());
-    let op = SelectObject(dc, pen.into());
-    let _ = Polygon(dc, &p);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    let _ = DeleteObject(br.into());
-    let _ = DeleteObject(pen.into());
-}
-
-unsafe fn draw_icon(dc: HDC, idx: i32) {
-    match idx {
-        0 => {
-            // Add URL: lingkaran hijau + plus putih.
-            fellipse(dc, 2, 2, 22, 22, GREEN);
-            frect(dc, 10, 6, 14, 18, WHITE);
-            frect(dc, 6, 10, 18, 14, WHITE);
-        }
-        1 => tri(dc, [(7, 5), (7, 19), (19, 12)], GREEN), // Resume: play
-        2 => frect(dc, 5, 5, 19, 19, RED),                // Stop
-        3 => {
-            // Stop All: kotak merah + garis putih bertumpuk.
-            frect(dc, 4, 5, 20, 19, RED);
-            frect(dc, 7, 9, 17, 10, WHITE);
-            frect(dc, 7, 13, 17, 14, WHITE);
-        }
-        4 => {
-            // Delete: X merah tebal.
-            line(dc, 6, 6, 18, 18, 3, RED);
-            line(dc, 18, 6, 6, 18, 3, RED);
-        }
-        5 => {
-            // Delete Completed: X merah kecil + centang emas.
-            line(dc, 5, 6, 13, 14, 2, RED);
-            line(dc, 13, 6, 5, 14, 2, RED);
-            line(dc, 13, 16, 16, 20, 2, GOLD);
-            line(dc, 16, 20, 22, 11, 2, GOLD);
-        }
-        6 => {
-            // Options: roda gigi (gear).
-            frect(dc, 11, 1, 13, 5, GRAY);
-            frect(dc, 11, 19, 13, 23, GRAY);
-            frect(dc, 1, 11, 5, 13, GRAY);
-            frect(dc, 19, 11, 23, 13, GRAY);
-            fellipse(dc, 4, 4, 20, 20, GRAY);
-            fellipse(dc, 9, 9, 15, 15, WHITE);
-        }
-        7 => {
-            // Scheduler: jam.
-            fellipse(dc, 2, 2, 22, 22, GRAY);
-            fellipse(dc, 4, 4, 20, 20, WHITE);
-            line(dc, 12, 12, 12, 6, 2, GRAY);
-            line(dc, 12, 12, 16, 14, 2, GRAY);
-        }
-        8 => {
-            // Start Queue: play + bar.
-            tri(dc, [(6, 5), (6, 19), (16, 12)], GREEN);
-            frect(dc, 17, 5, 21, 19, DGREEN);
-        }
-        9 => {
-            // Stop Queue: kotak + bar.
-            frect(dc, 5, 5, 15, 19, RED);
-            frect(dc, 17, 5, 21, 19, RED);
-        }
-        10 => {
-            // Tell a Friend: amplop biru.
-            frect(dc, 3, 7, 21, 18, BLUE);
-            line(dc, 3, 7, 12, 13, 1, WHITE);
-            line(dc, 21, 7, 12, 13, 1, WHITE);
-        }
-        _ => {}
-    }
-}
-
-/// Bangun ImageList 24x24 berisi 11 ikon toolbar (GDI, masking magenta).
+/// Bangun ImageList 24x24 ARGB dari blob BGRA (alpha penuh; antialiased).
 unsafe fn build_toolbar_imagelist() -> HIMAGELIST {
     const N: i32 = 11;
     const SZ: i32 = 24;
-    let key = rgb(255, 0, 255);
-    let himl = ImageList_Create(SZ, SZ, ILC_COLOR24 | ILC_MASK, N, 0);
+    let stride = (SZ * SZ * 4) as usize;
+    let himl = ImageList_Create(SZ, SZ, ILC_COLOR32, N, 0);
     let screen = GetDC(None);
-    let dc = CreateCompatibleDC(Some(screen));
-    for idx in 0..N {
-        let bmp = CreateCompatibleBitmap(screen, SZ, SZ);
-        let old = SelectObject(dc, bmp.into());
-        let kb = CreateSolidBrush(key);
-        let rc = RECT { left: 0, top: 0, right: SZ, bottom: SZ };
-        FillRect(dc, &rc, kb);
-        let _ = DeleteObject(kb.into());
-        draw_icon(dc, idx);
-        SelectObject(dc, old);
-        ImageList_AddMasked(himl, bmp, key);
-        let _ = DeleteObject(bmp.into());
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = SZ;
+    bmi.bmiHeader.biHeight = -SZ; // top-down; biCompression default 0 = BI_RGB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+
+    for i in 0..N as usize {
+        let src = &TB_ICONS[i * stride..(i + 1) * stride];
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        if let Ok(hbmp) = CreateDIBSection(Some(screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            if !bits.is_null() {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), bits as *mut u8, stride);
+            }
+            ImageList_Add(himl, hbmp, None);
+            let _ = DeleteObject(hbmp.into());
+        }
     }
-    let _ = DeleteDC(dc);
     ReleaseDC(None, screen);
     himl
 }

@@ -5,4 +5,5 @@
 *.svg binary
 *.png binary
 *.ico binary
+*.bin binary
 *.manifest text eol=lf
