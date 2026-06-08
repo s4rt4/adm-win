@@ -103,6 +103,9 @@ const ID_TELL_FRIEND: usize = 0x152;
 const ID_OPEN: usize = 0x153;
 const ID_OPEN_FOLDER: usize = 0x154;
 
+// Move to category (6 item).
+const ID_MOVE_BASE: usize = 0x180;
+
 // Tray menu.
 const ID_TRAY_SHOW: usize = 0x200;
 const ID_TRAY_AUTOSTART: usize = 0x201;
@@ -803,7 +806,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_EXIT => request_exit(hwnd),
         // Fitur milestone lain.
-        ID_SCHEDULER => info(hwnd, "Scheduler menyusul (WM6)."),
+        ID_SCHEDULER => crate::scheduler::show(hwnd),
         ID_OPTIONS => info(hwnd, "Options menyusul (WM7)."),
         ID_SL_UNLIM => set_global_limit(0),
         ID_SL_50 => set_global_limit(50 * 1024),
@@ -838,8 +841,46 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             let _ = autostart::toggle();
         }
         ID_TRAY_EXIT => request_exit(hwnd),
+        m if (ID_MOVE_BASE..ID_MOVE_BASE + 6).contains(&m) => do_move(hwnd, m - ID_MOVE_BASE),
         _ => {}
     }
+}
+
+unsafe fn do_move(hwnd: HWND, idx: usize) {
+    use crate::category::Category;
+    let cats = [
+        Category::General,
+        Category::Compressed,
+        Category::Documents,
+        Category::Music,
+        Category::Programs,
+        Category::Video,
+    ];
+    let Some(cat) = cats.get(idx).copied() else { return };
+    let Some(id) = selected_id() else { return };
+    let Some(row) = store::get(id) else { return };
+    if row.status == store::Status::Downloading {
+        info(hwnd, "Hentikan unduhan dulu sebelum memindah kategori.");
+        return;
+    }
+    let Some(engine) = ENGINE.get() else { return };
+    let filename = row.filename();
+    let mut newdir = engine.download_dir().to_path_buf();
+    if let Some(f) = cat.folder() {
+        newdir.push(f);
+    }
+    let _ = std::fs::create_dir_all(&newdir);
+    let newpath = newdir.join(&filename);
+    if newpath != row.output {
+        let _ = std::fs::rename(&row.output, &newpath);
+        let mut old_sc = row.output.clone().into_os_string();
+        old_sc.push(".adm");
+        let mut new_sc = newpath.clone().into_os_string();
+        new_sc.push(".adm");
+        let _ = std::fs::rename(&old_sc, &new_sc);
+    }
+    store::move_category(id, newpath, cat);
+    refresh_ui(hwnd);
 }
 
 unsafe fn do_add(hwnd: HWND) {
@@ -914,6 +955,16 @@ unsafe fn show_context_menu(hwnd: HWND) {
     sep(menu);
     append(menu, ID_REMOVE, w!("Remove from list"));
     append(menu, ID_DELETE, w!("Delete (file)"));
+    sep(menu);
+    let mv = CreatePopupMenu().unwrap_or_default();
+    for (i, c) in ["General", "Compressed", "Documents", "Music", "Programs", "Video"]
+        .iter()
+        .enumerate()
+    {
+        let h = HSTRING::from(*c);
+        let _ = AppendMenuW(mv, MF_STRING, ID_MOVE_BASE + i, PCWSTR(h.as_ptr()));
+    }
+    popup(menu, mv, w!("Move to category"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);

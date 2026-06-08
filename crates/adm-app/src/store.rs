@@ -199,3 +199,15 @@ pub fn remove_completed() -> usize {
 pub fn get(id: u64) -> Option<Row> {
     ROWS.lock().unwrap().iter().find(|r| r.id == id).cloned()
 }
+
+/// Pindahkan baris ke kategori lain (output baru sudah dihitung pemanggil).
+pub fn move_category(id: u64, output: PathBuf, category: Category) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.name = output
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| r.name.clone());
+        r.output = output;
+        r.category = category;
+    }
+}

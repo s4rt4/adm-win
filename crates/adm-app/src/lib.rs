@@ -10,6 +10,7 @@ pub mod engine;
 pub mod gui;
 pub mod ipc_server;
 pub mod progress;
+pub mod scheduler;
 pub mod single_instance;
 pub mod state;
 pub mod store;
@@ -63,6 +64,7 @@ pub fn run() {
         .expect("gagal membangun runtime tokio");
     let engine = engine::EngineHandle::new(rt.handle().clone(), default_download_dir(), gui::make_sink());
     gui::set_engine(engine.clone());
+    scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)
 
     std::thread::Builder::new()
         .name("adm-ipc".into())
