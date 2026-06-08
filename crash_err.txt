@@ -1,1 +1,0 @@
-[ipc] listen di \\.\pipe\adm

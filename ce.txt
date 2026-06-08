@@ -1,4 +1,0 @@
-[ipc] listen di \\.\pipe\adm
-[dbg] window created
-[dbg] tray added
-[dbg] shown; entering message loop
