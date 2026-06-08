@@ -144,3 +144,34 @@ async fn engine_downloads_in_process() {
         .unwrap();
     assert_eq!(sha(&got), sha(&payload), "checksum harus cocok");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routes_by_category() {
+    let payload = Arc::new(make_payload(256 * 1024));
+    let (base, _srv) = start_server(payload.clone());
+    let dir = tempfile::tempdir().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    let sink: EventSink = Arc::new(move |ev| {
+        let _ = tx.send(ev);
+    });
+    let engine = EngineHandle::new(tokio::runtime::Handle::current(), dir.path().to_path_buf(), sink);
+
+    // .zip → harus masuk subfolder Compressed (plan §10).
+    let id = engine.add(DownloadAddParams {
+        url: format!("{base}/pkg.zip"),
+        filename: Some("pkg.zip".into()),
+        ..Default::default()
+    });
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            EngineEvent::Completed { id: cid, .. } if cid == id => break,
+            EngineEvent::Failed { error, .. } => panic!("gagal: {error}"),
+            _ => {}
+        }
+    }
+
+    let expected = dir.path().join("Compressed").join("pkg.zip");
+    assert!(expected.exists(), "berkas .zip harus di subfolder Compressed: {}", expected.display());
+}

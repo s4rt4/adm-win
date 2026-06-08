@@ -1,6 +1,7 @@
 //! Model daftar unduhan untuk ListView (plan §9.9). Diperbarui dari event
 //! engine (thread tokio), dibaca WndProc (UI thread) — dilindungi Mutex.
 
+use crate::category::Category;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -37,6 +38,7 @@ pub struct Row {
     pub segments: Vec<(u64, u64, u64)>,
     /// Dialog "Download complete" sudah ditampilkan untuk baris ini.
     pub complete_announced: bool,
+    pub category: Category,
 }
 
 impl Row {
@@ -88,10 +90,12 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let category = Category::from_filename(&name);
     if let Some(r) = rows.iter_mut().find(|r| r.id == id) {
         r.url = url;
         r.output = output;
         r.name = name;
+        r.category = category;
         r.status = Status::Downloading;
     } else {
         rows.push(Row {
@@ -105,6 +109,7 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             status: Status::Downloading,
             segments: Vec::new(),
             complete_announced: false,
+            category,
         });
     }
 }

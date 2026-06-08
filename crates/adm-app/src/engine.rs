@@ -90,7 +90,13 @@ impl EngineHandle {
     }
 
     fn start(&self, id: u64, params: DownloadAddParams) {
-        let output = self.download_dir.join(pick_filename(&params, id));
+        let filename = pick_filename(&params, id);
+        // Auto-kategori → subfolder (plan §10).
+        let mut dir = self.download_dir.clone();
+        if let Some(folder) = crate::category::Category::from_filename(&filename).folder() {
+            dir.push(folder);
+        }
+        let output = dir.join(filename);
         let cancel = CancelToken::new();
         self.active.lock().unwrap().insert(id, cancel.clone());
 

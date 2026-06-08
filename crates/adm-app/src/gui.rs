@@ -14,6 +14,37 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 static ENGINE: OnceLock<EngineHandle> = OnceLock::new();
+/// Filter aktif dari sidebar kategori (kode = lParam node tree).
+static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+// Kode filter (lParam node tree).
+const F_ALL: u8 = 0;
+const F_COMPRESSED: u8 = 1;
+const F_DOCUMENTS: u8 = 2;
+const F_MUSIC: u8 = 3;
+const F_PROGRAMS: u8 = 4;
+const F_VIDEO: u8 = 5;
+const F_UNFINISHED: u8 = 6;
+const F_FINISHED: u8 = 7;
+const F_GRABBER: u8 = 8;
+const F_QUEUES: u8 = 9;
+
+fn filter_match(filter: u8, r: &store::Row) -> bool {
+    use crate::category::Category as C;
+    use store::Status;
+    match filter {
+        F_ALL => true,
+        F_COMPRESSED => r.category == C::Compressed,
+        F_DOCUMENTS => r.category == C::Documents,
+        F_MUSIC => r.category == C::Music,
+        F_PROGRAMS => r.category == C::Programs,
+        F_VIDEO => r.category == C::Video,
+        F_UNFINISHED => r.status != Status::Complete,
+        F_FINISHED => r.status == Status::Complete,
+        F_GRABBER | F_QUEUES => false, // belum ada isi (WM6 lanjutan)
+        _ => true,
+    }
+}
 
 const TRAY_UID: u32 = 1;
 const SIDEBAR_W: i32 = 190;
@@ -498,15 +529,16 @@ unsafe fn add_toolbar_buttons(tb: HWND) {
 
 // ============================ Categories ============================
 
-unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: PCWSTR) -> HTREEITEM {
+unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: PCWSTR, code: u8) -> HTREEITEM {
     let mut item = TVINSERTSTRUCTW {
         hParent: parent,
         hInsertAfter: TVI_LAST,
         ..Default::default()
     };
     item.Anonymous.item = TVITEMW {
-        mask: TVIF_TEXT,
+        mask: TVIF_TEXT | TVIF_PARAM,
         pszText: PWSTR(text.0 as *mut u16),
+        lParam: LPARAM(code as isize),
         ..Default::default()
     };
     let r = SendMessageW(tv, TVM_INSERTITEMW, Some(WPARAM(0)), Some(LPARAM(&item as *const _ as isize)));
@@ -514,17 +546,17 @@ unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: PCWSTR) -> HTREEITEM {
 }
 
 unsafe fn populate_categories(tv: HWND) {
-    let all = tv_insert(tv, TVI_ROOT, w!("All Downloads"));
-    tv_insert(tv, all, w!("Compressed"));
-    tv_insert(tv, all, w!("Documents"));
-    tv_insert(tv, all, w!("Music"));
-    tv_insert(tv, all, w!("Programs"));
-    tv_insert(tv, all, w!("Video"));
+    let all = tv_insert(tv, TVI_ROOT, w!("All Downloads"), F_ALL);
+    tv_insert(tv, all, w!("Compressed"), F_COMPRESSED);
+    tv_insert(tv, all, w!("Documents"), F_DOCUMENTS);
+    tv_insert(tv, all, w!("Music"), F_MUSIC);
+    tv_insert(tv, all, w!("Programs"), F_PROGRAMS);
+    tv_insert(tv, all, w!("Video"), F_VIDEO);
     let _ = SendMessageW(tv, TVM_EXPAND, Some(WPARAM(TVE_EXPAND.0 as usize)), Some(LPARAM(all.0)));
-    tv_insert(tv, TVI_ROOT, w!("Unfinished"));
-    tv_insert(tv, TVI_ROOT, w!("Finished"));
-    tv_insert(tv, TVI_ROOT, w!("Grabber projects"));
-    tv_insert(tv, TVI_ROOT, w!("Queues"));
+    tv_insert(tv, TVI_ROOT, w!("Unfinished"), F_UNFINISHED);
+    tv_insert(tv, TVI_ROOT, w!("Finished"), F_FINISHED);
+    tv_insert(tv, TVI_ROOT, w!("Grabber projects"), F_GRABBER);
+    tv_insert(tv, TVI_ROOT, w!("Queues"), F_QUEUES);
 }
 
 // ============================ ListView ============================
@@ -565,39 +597,57 @@ unsafe fn set_subitem(lv: HWND, item: i32, subitem: i32, text: &str) {
     SendMessageW(lv, LVM_SETITEMTEXTW, Some(WPARAM(item as usize)), Some(LPARAM(&mut lvi as *mut _ as isize)));
 }
 
-unsafe fn insert_row(lv: HWND, item: i32, text: &str) {
+unsafe fn insert_row(lv: HWND, item: i32, text: &str, id: u64) {
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     wide.push(0);
     let mut lvi = LVITEMW {
-        mask: LVIF_TEXT,
+        mask: LVIF_TEXT | LVIF_PARAM,
         iItem: item,
         iSubItem: 0,
         pszText: PWSTR(wide.as_mut_ptr()),
+        lParam: LPARAM(id as isize),
         ..Default::default()
     };
     SendMessageW(lv, LVM_INSERTITEMW, Some(WPARAM(0)), Some(LPARAM(&mut lvi as *mut _ as isize)));
 }
 
+/// id unduhan dari lParam item ListView (independen dari urutan/ filter).
+unsafe fn item_id(lv: HWND, index: i32) -> Option<u64> {
+    let mut lvi = LVITEMW {
+        mask: LVIF_PARAM,
+        iItem: index,
+        ..Default::default()
+    };
+    let r = SendMessageW(lv, LVM_GETITEMW, Some(WPARAM(0)), Some(LPARAM(&mut lvi as *mut _ as isize)));
+    if r.0 != 0 {
+        Some(lvi.lParam.0 as u64)
+    } else {
+        None
+    }
+}
+
 unsafe fn refresh_list(lv: HWND) {
+    let filter = FILTER.load(Ordering::Relaxed);
+    let visible: Vec<store::Row> =
+        store::with_rows(|rows| rows.iter().filter(|r| filter_match(filter, r)).cloned().collect());
+
     let count = SendMessageW(lv, LVM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
-    let rebuild = count != store::len();
+    let rebuild = count != visible.len();
     if rebuild {
         SendMessageW(lv, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
     }
-    store::with_rows(|rows| {
-        for (i, r) in rows.iter().enumerate() {
-            let idx = i as i32;
-            if rebuild {
-                insert_row(lv, idx, &r.filename());
-            } else {
-                set_subitem(lv, idx, 0, &r.filename());
-            }
-            set_subitem(lv, idx, 2, &fmt_size(r.size));
-            set_subitem(lv, idx, 3, &status_text(r));
-            set_subitem(lv, idx, 4, &fmt_eta(r.eta_secs()));
-            set_subitem(lv, idx, 5, &fmt_speed(r.speed_bps));
+    for (i, r) in visible.iter().enumerate() {
+        let idx = i as i32;
+        if rebuild {
+            insert_row(lv, idx, &r.filename(), r.id);
+        } else {
+            set_subitem(lv, idx, 0, &r.filename());
         }
-    });
+        set_subitem(lv, idx, 2, &fmt_size(r.size));
+        set_subitem(lv, idx, 3, &status_text(r));
+        set_subitem(lv, idx, 4, &fmt_eta(r.eta_secs()));
+        set_subitem(lv, idx, 5, &fmt_speed(r.speed_bps));
+    }
 }
 
 fn status_text(r: &store::Row) -> String {
@@ -616,6 +666,14 @@ unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
     let hdr = &*(lparam.0 as *const NMHDR);
     let lv = state::load_hwnd(&state::LIST_HWND);
     let tb = state::load_hwnd(&state::TOOLBAR_HWND);
+    let tv = state::load_hwnd(&state::TREE_HWND);
+
+    if Some(hdr.hwndFrom) == tv && hdr.code == TVN_SELCHANGEDW {
+        let nm = &*(lparam.0 as *const NMTREEVIEWW);
+        FILTER.store(nm.itemNew.lParam.0 as u8, Ordering::Relaxed);
+        refresh_ui(hwnd);
+        return;
+    }
 
     if Some(hdr.hwndFrom) == lv {
         match hdr.code {
@@ -675,7 +733,7 @@ fn selected_index(lv: HWND) -> Option<i32> {
 fn selected_id() -> Option<u64> {
     let lv = state::load_hwnd(&state::LIST_HWND)?;
     let idx = selected_index(lv)?;
-    store::id_at(idx as usize)
+    unsafe { item_id(lv, idx) }
 }
 
 // ============================ Commands ============================
@@ -776,7 +834,8 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
 }
 
 unsafe fn on_dblclick(hwnd: HWND, index: i32) {
-    let Some(id) = store::id_at(index as usize) else { return };
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return };
+    let Some(id) = item_id(lv, index) else { return };
     let Some(row) = store::get(id) else { return };
     if row.status == store::Status::Complete {
         let h = HSTRING::from(row.output.to_string_lossy().into_owned());
@@ -787,7 +846,8 @@ unsafe fn on_dblclick(hwnd: HWND, index: i32) {
 }
 
 unsafe fn open_selected(_hwnd: HWND, index: i32) {
-    if let Some(id) = store::id_at(index as usize) {
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return };
+    if let Some(id) = item_id(lv, index) {
         if let Some(row) = store::get(id) {
             if row.status == store::Status::Complete {
                 let h = HSTRING::from(row.output.to_string_lossy().into_owned());

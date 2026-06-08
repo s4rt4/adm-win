@@ -4,6 +4,7 @@
 //! `gui`/`state`/`tray`/`autostart`/`single_instance` adalah lapisan Windows.
 
 pub mod autostart;
+pub mod category;
 pub mod dialogs;
 pub mod engine;
 pub mod gui;
