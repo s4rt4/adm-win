@@ -8,6 +8,7 @@ pub mod dialogs;
 pub mod engine;
 pub mod gui;
 pub mod ipc_server;
+pub mod progress;
 pub mod single_instance;
 pub mod state;
 pub mod store;

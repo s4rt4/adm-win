@@ -87,6 +87,11 @@ pub fn set_engine(engine: EngineHandle) {
     let _ = ENGINE.set(engine);
 }
 
+/// Akses engine untuk modul lain (mis. dialog progres).
+pub fn engine() -> Option<EngineHandle> {
+    ENGINE.get().cloned()
+}
+
 /// EventSink GUI: perbarui store + post ke UI thread.
 pub fn make_sink() -> EventSink {
     Arc::new(|ev: EngineEvent| {
@@ -95,8 +100,8 @@ pub fn make_sink() -> EventSink {
                 eprintln!("[engine] #{id} mulai -> {}", output.display());
                 store::on_started(id, url, output);
             }
-            EngineEvent::Progress { id, downloaded, total, speed_bps } => {
-                store::on_progress(id, downloaded, total, speed_bps);
+            EngineEvent::Progress { id, downloaded, total, speed_bps, segments } => {
+                store::on_progress(id, downloaded, total, speed_bps, segments);
             }
             EngineEvent::Completed { id, bytes } => {
                 eprintln!("[engine] #{id} selesai ({bytes} byte)");
@@ -615,7 +620,7 @@ unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
             NM_DBLCLK => {
                 let ia = &*(lparam.0 as *const NMITEMACTIVATE);
                 if ia.iItem >= 0 {
-                    open_selected(hwnd, ia.iItem);
+                    on_dblclick(hwnd, ia.iItem);
                 }
             }
             NM_RCLICK => {
@@ -768,6 +773,17 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
     refresh_ui(hwnd);
 }
 
+unsafe fn on_dblclick(hwnd: HWND, index: i32) {
+    let Some(id) = store::id_at(index as usize) else { return };
+    let Some(row) = store::get(id) else { return };
+    if row.status == store::Status::Complete {
+        let h = HSTRING::from(row.output.to_string_lossy().into_owned());
+        ShellExecuteW(None, w!("open"), PCWSTR(h.as_ptr()), None, None, SW_SHOWNORMAL);
+    } else {
+        crate::progress::open(hwnd, id);
+    }
+}
+
 unsafe fn open_selected(_hwnd: HWND, index: i32) {
     if let Some(id) = store::id_at(index as usize) {
         if let Some(row) = store::get(id) {
@@ -827,6 +843,11 @@ unsafe fn refresh_ui(hwnd: HWND) {
     };
     let h = HSTRING::from(title);
     let _ = SetWindowTextW(hwnd, PCWSTR(h.as_ptr()));
+
+    // Dialog "Download complete" untuk unduhan yang baru selesai (§9.14).
+    for row in store::take_newly_completed() {
+        crate::progress::show_complete(hwnd, &row);
+    }
 }
 
 fn info(hwnd: HWND, msg: &str) {

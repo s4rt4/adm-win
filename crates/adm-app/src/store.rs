@@ -33,6 +33,10 @@ pub struct Row {
     pub downloaded: u64,
     pub speed_bps: u64,
     pub status: Status,
+    /// (start, end, downloaded) per segmen/koneksi — untuk SegmentBar (§9.11).
+    pub segments: Vec<(u64, u64, u64)>,
+    /// Dialog "Download complete" sudah ditampilkan untuk baris ini.
+    pub complete_announced: bool,
 }
 
 impl Row {
@@ -99,17 +103,41 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             downloaded: 0,
             speed_bps: 0,
             status: Status::Downloading,
+            segments: Vec::new(),
+            complete_announced: false,
         });
     }
 }
 
-pub fn on_progress(id: u64, downloaded: u64, total: Option<u64>, speed_bps: u64) {
+/// Baris yang baru selesai & belum ditampilkan dialog "Download complete";
+/// menandainya sudah diumumkan dan mengembalikan salinannya.
+pub fn take_newly_completed() -> Vec<Row> {
+    let mut out = Vec::new();
+    for r in ROWS.lock().unwrap().iter_mut() {
+        if r.status == Status::Complete && !r.complete_announced {
+            r.complete_announced = true;
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+pub fn on_progress(
+    id: u64,
+    downloaded: u64,
+    total: Option<u64>,
+    speed_bps: u64,
+    segments: Vec<(u64, u64, u64)>,
+) {
     if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
         r.downloaded = downloaded;
         if total.is_some() {
             r.size = total;
         }
         r.speed_bps = speed_bps;
+        if !segments.is_empty() {
+            r.segments = segments;
+        }
         r.status = Status::Downloading;
     }
 }

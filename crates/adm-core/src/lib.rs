@@ -15,7 +15,7 @@ mod probe;
 mod sidecar;
 
 pub use download::{
-    download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb,
+    download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb, SegmentProgress,
 };
 pub use error::{Error, Result};
 pub use probe::{probe, Probe};

@@ -41,6 +41,15 @@ pub struct DownloadRequest {
 }
 
 /// Snapshot progres untuk callback.
+/// Progres satu segmen/koneksi (untuk bar segmen di GUI, §9.11).
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentProgress {
+    pub start: u64,
+    /// inklusif.
+    pub end: u64,
+    pub downloaded: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Progress {
     pub downloaded: u64,
@@ -50,6 +59,8 @@ pub struct Progress {
     /// estimasi sisa waktu (detik); `None` bila tak terhitung.
     pub eta_secs: Option<u64>,
     pub connections: usize,
+    /// snapshot progres per segmen (kosong untuk unduhan satu-koneksi non-resumable).
+    pub segments: Vec<SegmentProgress>,
 }
 
 /// Hasil akhir.
@@ -319,6 +330,7 @@ async fn download_single(
                 speed_bps: 0,
                 eta_secs: None,
                 connections: 1,
+                segments: Vec::new(),
             });
         }
     }
@@ -348,12 +360,21 @@ fn spawn_reporter(
 
             if let Some(cb) = &on_progress {
                 let eta = total.saturating_sub(cur).checked_div(speed);
+                let segs: Vec<SegmentProgress> = segments
+                    .iter()
+                    .map(|s| SegmentProgress {
+                        start: s.start,
+                        end: s.end,
+                        downloaded: s.downloaded.load(Ordering::Relaxed),
+                    })
+                    .collect();
                 cb(Progress {
                     downloaded: cur,
                     total: Some(total),
                     speed_bps: speed,
                     eta_secs: eta,
                     connections: segments.len(),
+                    segments: segs,
                 });
             }
 

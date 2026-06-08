@@ -13,7 +13,14 @@ use tokio::runtime::Handle;
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Started { id: u64, url: String, output: PathBuf },
-    Progress { id: u64, downloaded: u64, total: Option<u64>, speed_bps: u64 },
+    Progress {
+        id: u64,
+        downloaded: u64,
+        total: Option<u64>,
+        speed_bps: u64,
+        /// (start, end, downloaded) per segmen.
+        segments: Vec<(u64, u64, u64)>,
+    },
     Completed { id: u64, bytes: u64 },
     Paused { id: u64, downloaded: u64 },
     Failed { id: u64, error: String },
@@ -104,11 +111,17 @@ impl EngineHandle {
         let active = self.active.clone();
         let prog = sink.clone();
         let on_progress: ProgressCb = Arc::new(move |p: Progress| {
+            let segments = p
+                .segments
+                .iter()
+                .map(|s| (s.start, s.end, s.downloaded))
+                .collect();
             prog(EngineEvent::Progress {
                 id,
                 downloaded: p.downloaded,
                 total: p.total,
                 speed_bps: p.speed_bps,
+                segments,
             });
         });
 
