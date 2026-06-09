@@ -977,9 +977,22 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             refresh_ui(hwnd);
         }
         ID_FIND | ID_FIND_NEXT => info(hwnd, "Find menyusul."),
-        ID_ADD_BATCH | ID_ADD_BATCH_CLIP => info(hwnd, "Batch download menyusul."),
-        ID_SITE_GRABBER => info(hwnd, "Site grabber = fase lanjutan."),
-        ID_EXPORT | ID_IMPORT => info(hwnd, "Export/Import menyusul."),
+        ID_ADD_BATCH => do_batch(hwnd, String::new()),
+        ID_ADD_BATCH_CLIP => {
+            let clip = crate::tasks::read_clipboard_text().unwrap_or_default();
+            let urls = crate::tasks::extract_urls(&clip);
+            if urls.is_empty() {
+                info(hwnd, "Tidak ada URL http(s) di clipboard.");
+            } else {
+                do_batch(hwnd, urls.join("\r\n"));
+            }
+        }
+        ID_EXPORT => do_export(hwnd),
+        ID_IMPORT => do_import(hwnd),
+        ID_SITE_GRABBER => {
+            let urls = crate::tasks::grabber_dialog(hwnd);
+            add_urls(hwnd, &urls);
+        }
         ID_REDOWNLOAD => info(hwnd, "Redownload menyusul."),
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
@@ -1082,6 +1095,57 @@ unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
         } else {
             engine.enqueue(params);
             refresh_ui(hwnd);
+        }
+    }
+}
+
+/// Dialog batch (Tasks → Add batch / from clipboard). `initial` prefill.
+unsafe fn do_batch(hwnd: HWND, initial: String) {
+    if let Some(text) = crate::tasks::batch_dialog(hwnd, &initial) {
+        let urls = crate::tasks::parse_batch(&text);
+        add_urls(hwnd, &urls);
+    }
+}
+
+/// Tambahkan banyak URL ke antrian (queued); user mulai via Start queue/Resume.
+unsafe fn add_urls(hwnd: HWND, urls: &[String]) {
+    if urls.is_empty() {
+        info(hwnd, "Tidak ada URL valid.");
+        return;
+    }
+    if let Some(e) = ENGINE.get() {
+        for u in urls {
+            e.enqueue(DownloadAddParams { url: u.clone(), ..Default::default() });
+        }
+    }
+    refresh_ui(hwnd);
+    info(hwnd, &format!("{} unduhan ditambahkan ke antrian.", urls.len()));
+}
+
+/// Export daftar URL semua unduhan ke berkas teks (satu URL per baris).
+unsafe fn do_export(hwnd: HWND) {
+    let urls = store::with_rows(|rows| rows.iter().map(|r| r.url.clone()).collect::<Vec<_>>());
+    if urls.is_empty() {
+        info(hwnd, "Daftar unduhan masih kosong.");
+        return;
+    }
+    if let Some(path) = crate::tasks::save_dialog(hwnd) {
+        match std::fs::write(&path, urls.join("\r\n")) {
+            Ok(_) => info(hwnd, &format!("{} URL diekspor ke:\n{}", urls.len(), path.display())),
+            Err(e) => info(hwnd, &format!("Gagal menulis berkas: {e}")),
+        }
+    }
+}
+
+/// Import daftar URL dari berkas teks → ditambahkan ke antrian.
+unsafe fn do_import(hwnd: HWND) {
+    if let Some(path) = crate::tasks::open_dialog(hwnd) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let urls = crate::tasks::parse_batch(&text);
+                add_urls(hwnd, &urls);
+            }
+            Err(e) => info(hwnd, &format!("Gagal membaca berkas: {e}")),
         }
     }
 }

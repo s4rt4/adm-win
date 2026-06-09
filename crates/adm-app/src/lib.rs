@@ -16,6 +16,7 @@ pub mod settings;
 pub mod single_instance;
 pub mod state;
 pub mod store;
+pub mod tasks;
 pub mod theme;
 
 use std::path::PathBuf;

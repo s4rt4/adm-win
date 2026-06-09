@@ -41,6 +41,7 @@ dependencies = [
  "thiserror",
  "tiny_http",
  "tokio",
+ "url",
 ]
 
 [[package]]

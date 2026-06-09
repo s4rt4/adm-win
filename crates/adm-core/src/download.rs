@@ -101,6 +101,13 @@ pub async fn probe_url(url: &str) -> Result<probe::Probe> {
     probe::probe(&client, url).await
 }
 
+/// Unduh isi sebuah halaman sebagai teks (dipakai site grabber).
+pub async fn fetch_text(url: &str) -> Result<String> {
+    let client = build_client()?;
+    let resp = client.get(url).send().await?.error_for_status()?;
+    Ok(resp.text().await?)
+}
+
 /// Jalankan unduhan (resume otomatis bila sidecar cocok). Blokir sampai
 /// selesai, paused (cancel), atau error.
 pub async fn download(
