@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -23,8 +24,18 @@ static THEME_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsi
 /// Tema gelap aktif (dibaca WndProc untuk custom-draw).
 static DARK: AtomicBool = AtomicBool::new(false);
 static STATUS_TEXT: Mutex<String> = Mutex::new(String::new());
-/// HMENU 6 popup menu utama (Tasks/File/Downloads/View/Help/About).
-static MENUS: Mutex<[isize; 6]> = Mutex::new([0; 6]);
+/// HMENU 5 popup menu utama (Tasks/File/Downloads/View/About).
+static MENUS: Mutex<[isize; 5]> = Mutex::new([0; 5]);
+
+// Dialog About (custom owner-draw).
+static ABOUT_REG: AtomicBool = AtomicBool::new(false);
+static ABOUT_DONE: AtomicBool = AtomicBool::new(false);
+static ABOUT_ICON: Mutex<isize> = Mutex::new(0);
+static ABOUT_LINK: Mutex<isize> = Mutex::new(0);
+const ABOUT_VERSION: &str = "0.1.0";
+const ABOUT_CLASS: PCWSTR = w!("AdmAboutDialog");
+const IDC_ABOUT_OK: usize = 1;
+const IDC_ABOUT_LINK: usize = 2;
 
 // Palet tema gelap dari logo (plan §12).
 const DARK_BG: (u8, u8, u8) = (26, 38, 32); // #1A2620
@@ -110,8 +121,6 @@ const ID_THEME_SYSTEM: usize = 0x137;
 const ID_FONT: usize = 0x138;
 const ID_LANGUAGE: usize = 0x139;
 
-const ID_HELP: usize = 0x140;
-const ID_CHECK_UPDATES: usize = 0x141;
 const ID_ABOUT: usize = 0x142;
 
 const ID_RESUME: usize = 0x150;
@@ -425,7 +434,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     .unwrap_or_default();
     SendMessageW(ms, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
     let mut mb: Vec<TBBUTTON> = Vec::new();
-    for (i, label) in ["Tasks", "File", "Downloads", "View", "Help", "About"].iter().enumerate() {
+    for (i, label) in ["Tasks", "File", "Downloads", "View", "About"].iter().enumerate() {
         mkbtn(&mut mb, ID_MENU_BASE + i, label, -2, false);
     }
     SendMessageW(ms, TB_ADDBUTTONSW, Some(WPARAM(mb.len())), Some(LPARAM(mb.as_ptr() as isize)));
@@ -609,10 +618,6 @@ unsafe fn build_menus() {
     append(view, ID_TRAY_ICON, w!("ADM tray icon"));
     append(view, ID_CUSTOMIZE, w!("Customize URL List..."));
 
-    let help = CreatePopupMenu().unwrap();
-    append(help, ID_HELP, w!("Help contents"));
-    append(help, ID_CHECK_UPDATES, w!("Check for updates..."));
-
     let about = CreatePopupMenu().unwrap();
     append(about, ID_ABOUT, w!("About ADM"));
 
@@ -621,7 +626,6 @@ unsafe fn build_menus() {
         file.0 as isize,
         dl.0 as isize,
         view.0 as isize,
-        help.0 as isize,
         about.0 as isize,
     ];
 }
@@ -949,9 +953,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_THEME_DARK => set_theme(hwnd, crate::settings::THEME_DARK),
         ID_THEME_LIGHT => set_theme(hwnd, crate::settings::THEME_LIGHT),
         ID_THEME_SYSTEM => set_theme(hwnd, crate::settings::THEME_SYSTEM),
-        ID_ABOUT => {
-            info(hwnd, "Alpha Download Manager (ADM)\nVersi 0.1.0\nDownload manager native Windows.");
-        }
+        ID_ABOUT => show_about(hwnd),
         ID_EXIT => request_exit(hwnd),
         // Fitur milestone lain.
         ID_SCHEDULER => crate::scheduler::show(hwnd),
@@ -982,7 +984,6 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
         }
-        ID_HELP | ID_CHECK_UPDATES => info(hwnd, "Menyusul."),
         ID_DROP_TARGET | ID_ARRANGE | ID_TOOLBAR | ID_TRAY_ICON | ID_CUSTOMIZE | ID_FONT
         | ID_LANGUAGE => info(hwnd, "Menyusul."),
         // Tray.
@@ -992,7 +993,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_TRAY_EXIT => request_exit(hwnd),
         m if (ID_MOVE_BASE..ID_MOVE_BASE + 6).contains(&m) => do_move(hwnd, m - ID_MOVE_BASE),
-        m if (ID_MENU_BASE..ID_MENU_BASE + 6).contains(&m) => open_menu(hwnd, m - ID_MENU_BASE),
+        m if (ID_MENU_BASE..ID_MENU_BASE + 5).contains(&m) => open_menu(hwnd, m - ID_MENU_BASE),
         _ => {}
     }
 }
@@ -1303,6 +1304,295 @@ fn info(hwnd: HWND, msg: &str) {
     unsafe {
         MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("ADM"), MB_OK | MB_ICONINFORMATION);
     }
+}
+
+// ============================ Dialog About ============================
+
+/// Dialog "About" custom: logo + layout rapi + badge status rilis (UNSTABLE).
+fn show_about(parent: HWND) {
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else { return };
+        let instance: HINSTANCE = module.into();
+
+        if !ABOUT_REG.swap(true, Ordering::SeqCst) {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(about_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: ABOUT_CLASS,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+        }
+
+        ABOUT_DONE.store(false, Ordering::SeqCst);
+        let icon = load_app_icon(72, 72);
+        *ABOUT_ICON.lock().unwrap() = icon.0 as isize;
+
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: 480, bottom: 300 };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let mut pr = RECT::default();
+        let _ = GetWindowRect(parent, &mut pr);
+        let x = pr.left + ((pr.right - pr.left) - dw) / 2;
+        let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
+
+        let Ok(dlg) = CreateWindowExW(
+            WS_EX_DLGMODALFRAME,
+            ABOUT_CLASS,
+            w!("About ADM"),
+            style,
+            x.max(0),
+            y.max(0),
+            dw,
+            dh,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        ) else {
+            return;
+        };
+
+        let gui_font = GetStockObject(DEFAULT_GUI_FONT);
+
+        // Tautan repo (klik → buka GitHub).
+        let link = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_0100), // SS_NOTIFY
+            28,
+            166,
+            280,
+            20,
+            Some(dlg),
+            Some(HMENU(IDC_ABOUT_LINK as *mut core::ffi::c_void)),
+            Some(instance),
+            None,
+        )
+        .unwrap_or_default();
+        let lh = HSTRING::from("github.com/s4rt4/adm-win");
+        let _ = SetWindowTextW(link, PCWSTR(lh.as_ptr()));
+        SendMessageW(link, WM_SETFONT, Some(WPARAM(gui_font.0 as usize)), Some(LPARAM(1)));
+        *ABOUT_LINK.lock().unwrap() = link.0 as isize;
+
+        // Tombol OK.
+        let ok = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("OK"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+            480 - 96,
+            252,
+            80,
+            28,
+            Some(dlg),
+            Some(HMENU(IDC_ABOUT_OK as *mut core::ffi::c_void)),
+            Some(instance),
+            None,
+        )
+        .unwrap_or_default();
+        SendMessageW(ok, WM_SETFONT, Some(WPARAM(gui_font.0 as usize)), Some(LPARAM(1)));
+
+        let _ = EnableWindow(parent, false);
+        let _ = ShowWindow(dlg, SW_SHOW);
+        let _ = SetForegroundWindow(dlg);
+        let _ = SetFocus(Some(ok));
+
+        let mut msg = MSG::default();
+        while !ABOUT_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if !IsDialogMessageW(dlg, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        let _ = EnableWindow(parent, true);
+        let _ = SetForegroundWindow(parent);
+        if IsWindow(Some(dlg)).as_bool() {
+            let _ = DestroyWindow(dlg);
+        }
+        let ic = *ABOUT_ICON.lock().unwrap();
+        if ic != 0 {
+            let _ = DestroyIcon(HICON(ic as *mut core::ffi::c_void));
+            *ABOUT_ICON.lock().unwrap() = 0;
+        }
+    }
+}
+
+extern "system" fn about_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                paint_about(hwnd);
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC => {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                SetBkMode(hdc, TRANSPARENT);
+                if lparam.0 == *ABOUT_LINK.lock().unwrap() {
+                    SetTextColor(hdc, COLORREF(0x00CC_6600)); // biru link (BGR)
+                } else {
+                    SetTextColor(hdc, COLORREF(0x0020_2020));
+                }
+                LRESULT(GetStockObject(WHITE_BRUSH).0 as isize)
+            }
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                match id {
+                    IDC_ABOUT_OK => {
+                        ABOUT_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDC_ABOUT_LINK => {
+                        ShellExecuteW(
+                            None,
+                            w!("open"),
+                            w!("https://github.com/s4rt4/adm-win"),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                ABOUT_DONE.store(true, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+unsafe fn ab_fill(hdc: HDC, l: i32, t: i32, r: i32, b: i32, bgr: u32) {
+    let brush = CreateSolidBrush(COLORREF(bgr));
+    let rc = RECT { left: l, top: t, right: r, bottom: b };
+    FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(brush.into());
+}
+
+unsafe fn ab_font(height: i32, weight: i32) -> HFONT {
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        0,
+        w!("Segoe UI"),
+    )
+}
+
+unsafe fn ab_text(hdc: HDC, s: &str, x: i32, y: i32) {
+    let mut wide: Vec<u16> = s.encode_utf16().collect();
+    let mut rc = RECT { left: x, top: y, right: x + 2000, bottom: y + 48 };
+    DrawTextW(hdc, &mut wide, &mut rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+unsafe fn ab_text_c(hdc: HDC, s: &str, x: i32, y: i32, w: i32, h: i32) {
+    let mut wide: Vec<u16> = s.encode_utf16().collect();
+    let mut rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    DrawTextW(hdc, &mut wide, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+unsafe fn ab_text_width(hdc: HDC, s: &str) -> i32 {
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let mut sz = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
+    sz.cx
+}
+
+unsafe fn paint_about(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let (w, h) = (rc.right, rc.bottom);
+    let footer_top = h - 56;
+
+    // Panel atas putih, footer abu-abu + garis pemisah.
+    ab_fill(hdc, 0, 0, w, footer_top, 0x00FF_FFFF);
+    ab_fill(hdc, 0, footer_top, w, h, 0x00F3_F3F3);
+    ab_fill(hdc, 0, footer_top, w, footer_top + 1, 0x00DE_DEDE);
+    ab_fill(hdc, 28, 150, w - 28, 151, 0x00EC_ECEC);
+
+    // Logo.
+    let ic = *ABOUT_ICON.lock().unwrap();
+    if ic != 0 {
+        let _ = DrawIconEx(hdc, 28, 30, HICON(ic as *mut core::ffi::c_void), 72, 72, 0, None, DI_NORMAL);
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+    let tx = 124;
+
+    // Judul.
+    let f = ab_font(-26, 700);
+    let prev = SelectObject(hdc, f.into());
+    SetTextColor(hdc, COLORREF(0x0020_2020));
+    ab_text(hdc, "Alpha Download Manager", tx, 32);
+    SelectObject(hdc, prev);
+    let _ = DeleteObject(f.into());
+
+    // Subjudul.
+    let f = ab_font(-15, 400);
+    let prev = SelectObject(hdc, f.into());
+    SetTextColor(hdc, COLORREF(0x006E_6E6E));
+    ab_text(hdc, "Native Windows download manager", tx + 2, 68);
+    SelectObject(hdc, prev);
+    let _ = DeleteObject(f.into());
+
+    // Baris versi.
+    let vtext = format!("Version {ABOUT_VERSION}");
+    let f = ab_font(-16, 600);
+    let prev = SelectObject(hdc, f.into());
+    SetTextColor(hdc, COLORREF(0x0040_4040));
+    ab_text(hdc, &vtext, tx + 2, 100);
+    let vw = ab_text_width(hdc, &vtext);
+    SelectObject(hdc, prev);
+    let _ = DeleteObject(f.into());
+
+    // Badge "UNSTABLE" (oranye, sudut membulat).
+    let f = ab_font(-12, 700);
+    let prev = SelectObject(hdc, f.into());
+    let bw = ab_text_width(hdc, "UNSTABLE") + 16;
+    let (bx, by, bh) = (tx + 2 + vw + 12, 99, 18);
+    let brush = CreateSolidBrush(COLORREF(0x0022_7EE6)); // RGB(230,126,34)
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(0x0022_7EE6));
+    let ob = SelectObject(hdc, brush.into());
+    let op = SelectObject(hdc, pen.into());
+    let _ = RoundRect(hdc, bx, by, bx + bw, by + bh, 9, 9);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteObject(pen.into());
+    SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+    ab_text_c(hdc, "UNSTABLE", bx, by, bw, bh);
+    SelectObject(hdc, prev);
+    let _ = DeleteObject(f.into());
+
+    // Hak cipta + catatan status (di bawah pemisah; tautan repo = child control).
+    let f = ab_font(-13, 400);
+    let prev = SelectObject(hdc, f.into());
+    SetTextColor(hdc, COLORREF(0x0080_8080));
+    ab_text(hdc, "\u{00A9} 2026 s4rt4 \u{00B7} Released under the MIT License", 28, 192);
+    ab_text(hdc, "Early pre-release \u{2014} expect bugs and breaking changes.", 28, 212);
+    SelectObject(hdc, prev);
+    let _ = DeleteObject(f.into());
+
+    let _ = EndPaint(hwnd, &ps);
 }
 
 fn request_exit(hwnd: HWND) {
