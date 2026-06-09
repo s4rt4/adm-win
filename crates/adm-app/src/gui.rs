@@ -1142,13 +1142,26 @@ pub fn open_folder(path: &std::path::Path) {
         .spawn();
 }
 
+/// AppendMenu dengan kondisi enable (disabled = abu-abu).
+unsafe fn append_en(menu: HMENU, id: usize, text: PCWSTR, enabled: bool) {
+    let flags = if enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
+    let _ = AppendMenuW(menu, flags, id, text);
+}
+
 unsafe fn show_context_menu(hwnd: HWND) {
+    use store::Status;
+    let status = selected_id().and_then(store::get).map(|r| r.status);
+    // Resume/Start relevan saat stopped/error/queued; Stop saat sedang unduh.
+    let can_resume = matches!(status, Some(Status::Paused | Status::Error | Status::Queued));
+    let can_stop = matches!(status, Some(Status::Downloading));
+    let is_complete = matches!(status, Some(Status::Complete));
+
     let menu = CreatePopupMenu().unwrap_or_default();
-    append(menu, ID_OPEN, w!("Open"));
+    append_en(menu, ID_OPEN, w!("Open"), is_complete);
     append(menu, ID_OPEN_FOLDER, w!("Open folder"));
     sep(menu);
-    append(menu, ID_RESUME, w!("Resume / Start"));
-    append(menu, ID_STOP, w!("Stop"));
+    append_en(menu, ID_RESUME, w!("Resume / Start"), can_resume);
+    append_en(menu, ID_STOP, w!("Stop"), can_stop);
     sep(menu);
     append(menu, ID_REMOVE, w!("Remove from list"));
     append(menu, ID_DELETE, w!("Delete (file)"));
