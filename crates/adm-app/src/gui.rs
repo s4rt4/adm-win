@@ -991,7 +991,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             let urls = crate::tasks::grabber_dialog(hwnd);
             add_urls(hwnd, &urls);
         }
-        ID_REDOWNLOAD => info(hwnd, "Redownload menyusul."),
+        ID_REDOWNLOAD => do_redownload(hwnd),
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
         }
@@ -1152,6 +1152,23 @@ unsafe fn do_import(hwnd: HWND) {
             Err(e) => info(hwnd, &format!("Gagal membaca berkas: {e}")),
         }
     }
+}
+
+/// Redownload: unduh ulang item terpilih dari awal — hentikan bila aktif,
+/// hapus berkas hasil + sidecar `.adm` agar tidak resume, lalu mulai lagi.
+unsafe fn do_redownload(hwnd: HWND) {
+    let Some(id) = selected_id() else { return };
+    let Some(row) = store::get(id) else { return };
+    let Some(e) = ENGINE.get() else { return };
+    e.cancel(id); // no-op bila tidak aktif
+    let _ = std::fs::remove_file(&row.output);
+    let mut sidecar = row.output.clone().into_os_string();
+    sidecar.push(".adm");
+    let _ = std::fs::remove_file(sidecar);
+    let fname = row.filename();
+    e.resume(id, row.url, fname);
+    refresh_ui(hwnd);
+    crate::progress::open(hwnd, id);
 }
 
 unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
