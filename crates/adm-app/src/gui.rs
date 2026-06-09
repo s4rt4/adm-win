@@ -69,10 +69,14 @@ fn filter_match(filter: u8, r: &store::Row) -> bool {
         F_VIDEO => r.category == C::Video,
         F_UNFINISHED => r.status != Status::Complete,
         F_FINISHED => r.status == Status::Complete,
-        F_GRABBER | F_QUEUES => false, // belum ada isi (WM6 lanjutan)
+        F_QUEUES => r.status == Status::Queued,
+        F_GRABBER => GRABBER_IDS.lock().unwrap().contains(&r.id),
         _ => true,
     }
 }
+
+/// id unduhan yang ditambahkan via Site Grabber (untuk node "Grabber projects").
+static GRABBER_IDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 const TRAY_UID: u32 = 1;
 const SIDEBAR_W: i32 = 190;
@@ -438,6 +442,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
         mkbtn(&mut mb, ID_MENU_BASE + i, label, -2, false);
     }
     SendMessageW(ms, TB_ADDBUTTONSW, Some(WPARAM(mb.len())), Some(LPARAM(mb.as_ptr() as isize)));
+    SendMessageW(ms, TB_SETINDENT, Some(WPARAM(10)), Some(LPARAM(0))); // jangan mepet kiri
     SendMessageW(ms, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
     state::store_hwnd(&state::MENUSTRIP_HWND, ms);
 
@@ -461,6 +466,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     let diml = build_disabled_imagelist();
     SendMessageW(tb, TB_SETDISABLEDIMAGELIST, Some(WPARAM(0)), Some(LPARAM(diml.0)));
     add_toolbar_buttons(tb);
+    SendMessageW(tb, TB_SETINDENT, Some(WPARAM(10)), Some(LPARAM(0))); // jangan mepet kiri
     SendMessageW(tb, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
     state::store_hwnd(&state::TOOLBAR_HWND, tb);
 
@@ -1022,7 +1028,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_IMPORT => do_import(hwnd),
         ID_SITE_GRABBER => {
             let urls = crate::tasks::grabber_dialog(hwnd);
-            add_urls(hwnd, &urls);
+            add_urls(hwnd, &urls, true);
         }
         ID_REDOWNLOAD => do_redownload(hwnd),
         ID_REFRESH_LINK => {
@@ -1145,19 +1151,23 @@ unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
 unsafe fn do_batch(hwnd: HWND, initial: String) {
     if let Some(text) = crate::tasks::batch_dialog(hwnd, &initial) {
         let urls = crate::tasks::parse_batch(&text);
-        add_urls(hwnd, &urls);
+        add_urls(hwnd, &urls, false);
     }
 }
 
 /// Tambahkan banyak URL ke antrian (queued); user mulai via Start queue/Resume.
-unsafe fn add_urls(hwnd: HWND, urls: &[String]) {
+/// `from_grabber` → id dicatat agar muncul di node sidebar "Grabber projects".
+unsafe fn add_urls(hwnd: HWND, urls: &[String], from_grabber: bool) {
     if urls.is_empty() {
         info(hwnd, "Tidak ada URL valid.");
         return;
     }
     if let Some(e) = ENGINE.get() {
         for u in urls {
-            e.enqueue(DownloadAddParams { url: u.clone(), ..Default::default() });
+            let id = e.enqueue(DownloadAddParams { url: u.clone(), ..Default::default() });
+            if from_grabber {
+                GRABBER_IDS.lock().unwrap().push(id);
+            }
         }
     }
     refresh_ui(hwnd);
@@ -1185,7 +1195,7 @@ unsafe fn do_import(hwnd: HWND) {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let urls = crate::tasks::parse_batch(&text);
-                add_urls(hwnd, &urls);
+                add_urls(hwnd, &urls, false);
             }
             Err(e) => info(hwnd, &format!("Gagal membaca berkas: {e}")),
         }
