@@ -1012,6 +1012,9 @@ unsafe fn open_menu(hwnd: HWND, idx: usize) {
         return;
     }
     let menu = HMENU(h as *mut core::ffi::c_void);
+    if idx == 1 {
+        update_file_menu(menu); // menu "File" — item kondisional ikut status
+    }
     let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) else { return };
     let mut wr = RECT::default();
     let _ = GetWindowRect(ms, &mut wr);
@@ -1146,6 +1149,25 @@ pub fn open_folder(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe")
         .raw_arg(format!("/select,\"{}\"", path.display()))
         .spawn();
+}
+
+/// Enable/disable item menu "File" sesuai status download terpilih.
+/// Stop Download → sedang unduh; Remove → ada yang dipilih;
+/// Download Now → bisa dilanjut (paused/error/queued); Redownload → selesai/error.
+unsafe fn update_file_menu(menu: HMENU) {
+    use store::Status;
+    let status = selected_id().and_then(store::get).map(|r| r.status);
+    let can_stop = matches!(status, Some(Status::Downloading));
+    let can_resume = matches!(status, Some(Status::Paused | Status::Error | Status::Queued));
+    let can_redo = matches!(status, Some(Status::Complete | Status::Error));
+    let en = |id: usize, on: bool| {
+        let flag = if on { MF_ENABLED } else { MF_GRAYED };
+        let _ = EnableMenuItem(menu, id as u32, MF_BYCOMMAND | flag);
+    };
+    en(ID_STOP, can_stop);
+    en(ID_REMOVE, status.is_some());
+    en(ID_DOWNLOAD_NOW, can_resume);
+    en(ID_REDOWNLOAD, can_redo);
 }
 
 /// AppendMenu dengan kondisi enable (disabled = abu-abu).
