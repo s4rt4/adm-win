@@ -154,6 +154,22 @@ unsafe fn register_classes() {
 /// Buka dialog progres modeless untuk unduhan `id`.
 pub fn open(parent: HWND, id: u64) {
     unsafe {
+        // Sudah ada dialog untuk id ini → fokuskan, jangan buat ganda.
+        let existing = OPEN_DIALOGS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, h)| *h);
+        if let Some(h) = existing {
+            let hwnd = HWND(h as *mut core::ffi::c_void);
+            if IsWindow(Some(hwnd)).as_bool() {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+                return;
+            }
+        }
+
         register_classes();
         let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
 

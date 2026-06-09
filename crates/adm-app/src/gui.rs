@@ -932,6 +932,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 if let Some(r) = store::get(id) {
                     let fname = r.filename();
                     e.resume(id, r.url, fname);
+                    refresh_ui(hwnd);
+                    crate::progress::open(hwnd, id); // dialog status muncul lagi
                 }
             }
         }
