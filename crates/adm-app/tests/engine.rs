@@ -65,28 +65,35 @@ fn handle(req: tiny_http::Request, payload: &[u8]) {
         .iter()
         .find(|h| h.field.equiv("Range"))
         .map(|h| h.value.as_str().to_string());
+    let named = req.url().contains("named"); // → kirim Content-Disposition
     let etag = Header::from_bytes(&b"ETag"[..], &b"\"v1\""[..]).unwrap();
 
-    match range.as_deref().and_then(parse_range) {
+    let mut resp = match range.as_deref().and_then(parse_range) {
         Some((a, b)) => {
             let b = b.unwrap_or(total as u64 - 1).min(total as u64 - 1);
             let a = a.min(total as u64 - 1);
             let slice = payload[a as usize..=b as usize].to_vec();
             let cr = format!("bytes {}-{}/{}", a, b, total);
-            let resp = Response::from_data(slice)
+            Response::from_data(slice)
                 .with_status_code(StatusCode(206))
                 .with_header(Header::from_bytes(&b"Content-Range"[..], cr.as_bytes()).unwrap())
                 .with_header(Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap())
-                .with_header(etag);
-            let _ = req.respond(resp);
+                .with_header(etag)
         }
-        None => {
-            let resp = Response::from_data(payload.to_vec())
-                .with_header(Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap())
-                .with_header(etag);
-            let _ = req.respond(resp);
-        }
+        None => Response::from_data(payload.to_vec())
+            .with_header(Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap())
+            .with_header(etag),
+    };
+    if named {
+        resp = resp.with_header(
+            Header::from_bytes(
+                &b"Content-Disposition"[..],
+                &b"attachment; filename=\"real-name.rar\""[..],
+            )
+            .unwrap(),
+        );
     }
+    let _ = req.respond(resp);
 }
 
 fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {
@@ -217,4 +224,36 @@ async fn queue_respects_max() {
     }
     assert_eq!(completed, 3, "ketiga unduhan antrian harus selesai");
     assert!(peak <= 1, "konkuren melebihi batas (max=1): {peak}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filename_from_content_disposition() {
+    let payload = Arc::new(make_payload(64 * 1024));
+    let (base, _srv) = start_server(payload.clone());
+    let dir = tempfile::tempdir().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    let sink: EventSink = Arc::new(move |ev| {
+        let _ = tx.send(ev);
+    });
+    let engine = EngineHandle::new(tokio::runtime::Handle::current(), dir.path().to_path_buf(), sink);
+
+    // URL tanpa nama berguna; server mengirim Content-Disposition real-name.rar.
+    let id = engine.add(DownloadAddParams {
+        url: format!("{base}/named?x=1"),
+        filename: None,
+        ..Default::default()
+    });
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            EngineEvent::Completed { id: cid, .. } if cid == id => break,
+            EngineEvent::Failed { error, .. } => panic!("gagal: {error}"),
+            _ => {}
+        }
+    }
+
+    // .rar → kategori Compressed.
+    let expected = dir.path().join("Compressed").join("real-name.rar");
+    assert!(expected.exists(), "nama dari Content-Disposition harus dipakai: {}", expected.display());
 }

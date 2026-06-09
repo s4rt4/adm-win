@@ -201,7 +201,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: load_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)),
+            hIcon: load_app_icon(256, 256),
             hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void),
             lpszClassName: class_name,
             ..Default::default()
@@ -227,7 +227,9 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
 
         // Ikon kecil & besar untuk taskbar/titlebar.
         let small = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
-        let big = load_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        // ICON_BIG dipakai taskbar/Alt-Tab & di-scale shell — ambil 256px agar
+        // downscale tajam (tidak blur di DPI tinggi). Plan §15 bug ikon.
+        let big = load_app_icon(256, 256);
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(big.0 as isize)));
 

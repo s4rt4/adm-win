@@ -91,6 +91,13 @@ fn build_client() -> Result<Client> {
         .build()?)
 }
 
+/// Probe ringan satu URL (bangun client sendiri) — untuk resolusi nama berkas
+/// (Content-Disposition) sebelum mulai mengunduh.
+pub async fn probe_url(url: &str) -> Result<probe::Probe> {
+    let client = build_client()?;
+    probe::probe(&client, url).await
+}
+
 /// Jalankan unduhan (resume otomatis bila sidecar cocok). Blokir sampai
 /// selesai, paused (cancel), atau error.
 pub async fn download(

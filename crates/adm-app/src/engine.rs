@@ -189,7 +189,6 @@ impl EngineHandle {
     }
 
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
-        let output = self.output_for(&params, id);
         let cancel = CancelToken::new();
         let per_limiter = Arc::new(Limiter::unlimited());
         self.active
@@ -197,17 +196,7 @@ impl EngineHandle {
             .unwrap()
             .insert(id, (cancel.clone(), per_limiter.clone()));
 
-        let req = DownloadRequest {
-            url: params.url.clone(),
-            output: output.clone(),
-            connections: 8,
-        };
-
-        (self.sink)(EngineEvent::Started { id, url: params.url.clone(), output });
-
-        let sink = self.sink.clone();
-        let active = self.active.clone();
-        let prog = sink.clone();
+        let prog = self.sink.clone();
         let on_progress: ProgressCb = Arc::new(move |p: Progress| {
             let segments = p.segments.iter().map(|s| (s.start, s.end, s.downloaded)).collect();
             prog(EngineEvent::Progress {
@@ -222,22 +211,83 @@ impl EngineHandle {
         let this = self.clone();
         let global_limiter = self.global_limiter.clone();
         self.handle.spawn(async move {
+            // Tentukan nama berkas (Content-Disposition bila nama generik/absen).
+            let name = this.resolve_filename(&params, id).await;
+            let mut dir = this.download_dir.lock().unwrap().clone();
+            if let Some(folder) = Category::from_filename(&name).folder() {
+                dir.push(folder);
+            }
+            let output = dir.join(&name);
+
+            (this.sink)(EngineEvent::Started {
+                id,
+                url: params.url.clone(),
+                output: output.clone(),
+            });
+
+            let req = DownloadRequest {
+                url: params.url.clone(),
+                output,
+                connections: 8,
+            };
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
-            active.lock().unwrap().remove(&id);
-            // Emit event terminal DULU (slot dianggap selesai) sebelum memulai
-            // item antrian berikutnya — agar pengamat tak melihat konkuren palsu.
+            this.active.lock().unwrap().remove(&id);
+            // Emit event terminal DULU sebelum memulai item antrian berikutnya.
             let ev = match res {
                 Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
                 Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
                 Err(e) => EngineEvent::Failed { id, error: e.to_string() },
             };
-            sink(ev);
+            (this.sink)(ev);
             if queued {
                 this.queue.lock().unwrap().running_ids.remove(&id);
                 this.pump();
             }
         });
     }
+
+    /// Nama berkas akhir. Prioritas: nama eksplisit non-generik dari pemanggil
+    /// (browser/dialog) → `Content-Disposition` server → basename URL → fallback.
+    async fn resolve_filename(&self, params: &DownloadAddParams, id: u64) -> String {
+        let provided = params
+            .filename
+            .as_deref()
+            .map(sanitize)
+            .filter(|s| !s.is_empty());
+
+        if let Some(p) = &provided {
+            if !looks_generic(p) {
+                return p.clone();
+            }
+        }
+        if let Ok(pr) = adm_core::probe_url(&params.url).await {
+            if let Some(cd) = pr.suggested_filename {
+                let cd = sanitize(&cd);
+                if !cd.is_empty() && !looks_generic(&cd) {
+                    return cd;
+                }
+            }
+        }
+        provided
+            .or_else(|| url_basename(&params.url))
+            .unwrap_or_else(|| format!("download-{id}.bin"))
+    }
+}
+
+fn looks_generic(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "download.bin"
+        || n == "download"
+        || (n.starts_with("download-") && n.ends_with(".bin"))
+        || !n.contains('.') // tanpa ekstensi
+}
+
+fn url_basename(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    path.rsplit('/')
+        .next()
+        .map(sanitize)
+        .filter(|s| !s.is_empty() && s.contains('.'))
 }
 
 fn pick_filename(params: &DownloadAddParams, id: u64) -> String {
