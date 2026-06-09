@@ -127,6 +127,7 @@ const ID_DELETE: usize = 0x151;
 const ID_UPDATES: usize = 0x152;
 const ID_OPEN: usize = 0x153;
 const ID_OPEN_FOLDER: usize = 0x154;
+const ID_REFRESH_LINK: usize = 0x155;
 
 // Move to category (6 item).
 const ID_MOVE_BASE: usize = 0x180;
@@ -686,6 +687,7 @@ unsafe fn add_toolbar_buttons(tb: HWND) {
     mksep(&mut buttons);
     mkbtn(&mut buttons, ID_OPTIONS, "Options", 6, false);
     mkbtn(&mut buttons, ID_SCHEDULER, "Scheduler", 7, false);
+    mkbtn(&mut buttons, ID_REFRESH_LINK, "Refresh Link", 11, false);
     mksep(&mut buttons);
     mkbtn(&mut buttons, ID_START_QUEUE, "Start Queue", 8, true);
     mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Queue", 9, true);
@@ -1023,6 +1025,11 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             add_urls(hwnd, &urls);
         }
         ID_REDOWNLOAD => do_redownload(hwnd),
+        ID_REFRESH_LINK => {
+            if let Some(id) = selected_id() {
+                do_refresh_link(hwnd, id);
+            }
+        }
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
         }
@@ -1264,6 +1271,47 @@ unsafe fn find_from(hwnd: HWND, start: i32) {
     info(hwnd, &format!("Tidak ditemukan: {}", *FIND_QUERY.lock().unwrap()));
 }
 
+/// Refresh Link: tempel URL segar untuk item terpilih, lalu lanjutkan dari
+/// offset yang sudah terunduh (engine mencocokkan berdasarkan ukuran, bukan
+/// URL — lihat `Sidecar::is_compatible`). Nama berkas lama dipertahankan agar
+/// data parsial dipakai, bukan mulai dari awal.
+unsafe fn do_refresh_link(hwnd: HWND, id: u64) {
+    let Some(row) = store::get(id) else { return };
+    let Some(e) = ENGINE.get() else { return };
+    let prompt = crate::tasks::prompt_dialog(
+        hwnd,
+        "Refresh Link",
+        "Tempel URL baru (link segar untuk berkas yang sama):",
+        &row.url,
+    );
+    if let Some(new_url) = prompt {
+        let new_url = new_url.trim().to_string();
+        if new_url.is_empty() || new_url == row.url {
+            return;
+        }
+        e.resume(id, new_url, row.filename());
+        refresh_ui(hwnd);
+        crate::progress::open(hwnd, id);
+    }
+}
+
+/// Popup saat unduhan gagal (link kedaluwarsa dll). Tawarkan Refresh Link.
+unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
+    let msg = HSTRING::from(format!(
+        "Download gagal:\n{}\n\nLink mungkin sudah kedaluwarsa. Buka tautan asli, salin link baru, lalu masukkan di sini. Unduhan akan dilanjutkan dari posisi terakhir.\n\nRefresh link sekarang?",
+        row.filename()
+    ));
+    let r = MessageBoxW(
+        Some(hwnd),
+        PCWSTR(msg.as_ptr()),
+        w!("Download failed"),
+        MB_YESNO | MB_ICONWARNING,
+    );
+    if r == IDYES {
+        do_refresh_link(hwnd, row.id);
+    }
+}
+
 /// Redownload: unduh ulang item terpilih dari awal — hentikan bila aktif,
 /// hapus berkas hasil + sidecar `.adm` agar tidak resume, lalu mulai lagi.
 unsafe fn do_redownload(hwnd: HWND) {
@@ -1390,6 +1438,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
     append_en(menu, ID_RESUME, w!("Resume / Start"), can_resume);
     append_en(menu, ID_STOP, w!("Stop"), can_stop);
     sep(menu);
+    // Refresh Link: ganti URL kedaluwarsa dengan link segar, resume dari offset.
+    append_en(menu, ID_REFRESH_LINK, w!("Refresh Link..."), can_resume);
+    sep(menu);
     append(menu, ID_REMOVE, w!("Remove from list"));
     append(menu, ID_DELETE, w!("Delete (file)"));
     sep(menu);
@@ -1438,6 +1489,13 @@ unsafe fn refresh_ui(hwnd: HWND) {
             crate::progress::show_complete(hwnd, &row);
         }
     }
+
+    // Unduhan gagal (mis. link kedaluwarsa): tutup dialog status, tawarkan
+    // Refresh Link.
+    for row in store::take_newly_failed() {
+        crate::progress::close_for(row.id);
+        show_failed_popup(hwnd, &row);
+    }
 }
 
 /// Enable/disable tombol toolbar sesuai seleksi & status (mirip §9.3 File menu).
@@ -1455,6 +1513,7 @@ unsafe fn update_toolbar_state() {
     };
     en(ID_RESUME, active);
     en(ID_STOP, active);
+    en(ID_REFRESH_LINK, active); // relevan saat belum selesai
     en(ID_STOP_ALL, !complete); // aktif saat tanpa seleksi / sedang unduh
     en(ID_DELETE, sel.is_some());
     // Add URL & Delete Completed selalu aktif.
@@ -1907,7 +1966,7 @@ unsafe fn toolbar_customdraw(lparam: LPARAM) -> LRESULT {
 /// Bangun ImageList 24x24 ARGB dari blob BGRA. Ikon Lucide monokrom hitam;
 /// untuk tema gelap di-tint jadi abu terang (premultiplied) agar terlihat.
 unsafe fn build_imagelist_with(transform: impl Fn(&mut [u8])) -> HIMAGELIST {
-    const N: i32 = 11;
+    const N: i32 = 12;
     const SZ: i32 = 24;
     let stride = (SZ * SZ * 4) as usize;
     let himl = ImageList_Create(SZ, SZ, ILC_COLOR32, N, 0);

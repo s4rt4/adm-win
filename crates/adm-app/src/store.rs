@@ -40,6 +40,8 @@ pub struct Row {
     pub segments: Vec<(u64, u64, u64)>,
     /// Dialog "Download complete" sudah ditampilkan untuk baris ini.
     pub complete_announced: bool,
+    /// Popup "Download failed" sudah ditampilkan untuk kegagalan terakhir.
+    pub failed_announced: bool,
     pub category: Category,
 }
 
@@ -105,6 +107,7 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
         r.name = name;
         r.category = category;
         r.status = Status::Downloading;
+        r.failed_announced = false; // mulai lagi → kegagalan berikutnya diumumkan
     } else {
         rows.push(Row {
             id,
@@ -117,6 +120,7 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             status: Status::Downloading,
             segments: Vec::new(),
             complete_announced: false,
+            failed_announced: false,
             category,
         });
     }
@@ -144,6 +148,7 @@ pub fn on_queued(id: u64, url: String, output: PathBuf) {
         status: Status::Queued,
         segments: Vec::new(),
         complete_announced: false,
+        failed_announced: false,
         category,
     });
 }
@@ -155,6 +160,18 @@ pub fn take_newly_completed() -> Vec<Row> {
     for r in ROWS.lock().unwrap().iter_mut() {
         if r.status == Status::Complete && !r.complete_announced {
             r.complete_announced = true;
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+/// Baris yang baru gagal & belum ditampilkan popup "Download failed".
+pub fn take_newly_failed() -> Vec<Row> {
+    let mut out = Vec::new();
+    for r in ROWS.lock().unwrap().iter_mut() {
+        if r.status == Status::Error && !r.failed_announced {
+            r.failed_announced = true;
             out.push(r.clone());
         }
     }

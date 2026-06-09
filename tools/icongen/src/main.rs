@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 /// Urutan HARUS sama dengan indeks iBitmap toolbar di gui.rs.
-const TOOLBAR_ORDER: [&str; 11] = [
+const TOOLBAR_ORDER: [&str; 12] = [
     "add-url",
     "resume",
     "stop",
@@ -19,6 +19,7 @@ const TOOLBAR_ORDER: [&str; 11] = [
     "start-queue",
     "stop-queue",
     "updates",
+    "refresh-link",
 ];
 
 fn main() {

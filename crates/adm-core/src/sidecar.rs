@@ -58,24 +58,80 @@ pub fn remove(path: &Path) {
 
 impl Sidecar {
     /// Apakah sidecar masih cocok dengan kondisi server saat ini (resume aman).
+    ///
+    /// Kunci kecocokan adalah **ukuran total** (sinyal identitas file). Bila URL
+    /// sama, validator (ETag/Last-Modified) ditegakkan ketat. Bila URL berbeda
+    /// — kasus "Refresh Link": link kedaluwarsa diganti link segar untuk file
+    /// yang sama — validator TIDAK diwajibkan, karena link yang diregenerasi
+    /// sering mengubah ETag/Last-Modified meski byte-nya identik. Resume tetap
+    /// dari offset selama ukuran cocok.
     pub fn is_compatible(&self, url: &str, probe: &Probe) -> bool {
-        if self.url != url {
-            return false;
-        }
         if Some(self.total) != probe.total {
             return false;
         }
-        // Validator: bila kedua sisi punya ETag, harus sama; idem Last-Modified.
-        if let (Some(a), Some(b)) = (&self.etag, &probe.etag) {
-            if a != b {
-                return false;
+        if self.url == url {
+            if let (Some(a), Some(b)) = (&self.etag, &probe.etag) {
+                if a != b {
+                    return false;
+                }
             }
-        }
-        if let (Some(a), Some(b)) = (&self.last_modified, &probe.last_modified) {
-            if a != b {
-                return false;
+            if let (Some(a), Some(b)) = (&self.last_modified, &probe.last_modified) {
+                if a != b {
+                    return false;
+                }
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sidecar(url: &str, total: u64, etag: Option<&str>) -> Sidecar {
+        Sidecar {
+            url: url.into(),
+            total,
+            etag: etag.map(|s| s.into()),
+            last_modified: None,
+            segments: vec![],
+        }
+    }
+
+    fn probe(total: u64, etag: Option<&str>) -> Probe {
+        Probe {
+            total: Some(total),
+            resumable: true,
+            etag: etag.map(|s| s.into()),
+            last_modified: None,
+            suggested_filename: None,
+        }
+    }
+
+    #[test]
+    fn same_url_same_size_compatible() {
+        let sc = sidecar("http://a/x", 1000, Some("v1"));
+        assert!(sc.is_compatible("http://a/x", &probe(1000, Some("v1"))));
+    }
+
+    #[test]
+    fn same_url_etag_changed_incompatible() {
+        let sc = sidecar("http://a/x", 1000, Some("v1"));
+        assert!(!sc.is_compatible("http://a/x", &probe(1000, Some("v2"))));
+    }
+
+    #[test]
+    fn refresh_link_new_url_same_size_compatible() {
+        // Kasus Refresh Link: URL beda, ukuran sama, ETag beda → tetap resume.
+        let sc = sidecar("http://a/old?token=expired", 1000, Some("v1"));
+        assert!(sc.is_compatible("http://a/fresh?token=new", &probe(1000, Some("v2"))));
+    }
+
+    #[test]
+    fn refresh_link_size_mismatch_incompatible() {
+        // Ukuran beda → kemungkinan file beda → jangan resume (mulai awal).
+        let sc = sidecar("http://a/old", 1000, None);
+        assert!(!sc.is_compatible("http://a/fresh", &probe(2048, None)));
     }
 }
