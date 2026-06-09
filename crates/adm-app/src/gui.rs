@@ -304,6 +304,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 create_children(hwnd, instance);
                 apply_theme(hwnd);
                 update_theme_checks();
+                update_toolbar_state(); // mulai: tanpa seleksi
                 layout(hwnd);
                 LRESULT(0)
             }
@@ -863,6 +864,7 @@ unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
                 }
                 show_context_menu(hwnd);
             }
+            LVN_ITEMCHANGED => update_toolbar_state(), // seleksi berubah
             _ => {}
         }
     } else if Some(hdr.hwndFrom) == tb && hdr.code == TBN_DROPDOWN {
@@ -1200,6 +1202,8 @@ unsafe fn refresh_ui(hwnd: HWND) {
     let h = HSTRING::from(title);
     let _ = SetWindowTextW(hwnd, PCWSTR(h.as_ptr()));
 
+    update_toolbar_state();
+
     // Unduhan baru selesai: tutup dialog status (tak diperlukan lagi), lalu
     // tampilkan dialog "Download complete" (§9.14).
     let show_complete = crate::settings::get().show_complete_dialog;
@@ -1209,6 +1213,26 @@ unsafe fn refresh_ui(hwnd: HWND) {
             crate::progress::show_complete(hwnd, &row);
         }
     }
+}
+
+/// Enable/disable tombol toolbar sesuai seleksi & status (mirip §9.3 File menu).
+unsafe fn update_toolbar_state() {
+    use store::Status;
+    let Some(tb) = state::load_hwnd(&state::TOOLBAR_HWND) else { return };
+    let sel = selected_id().and_then(store::get).map(|r| r.status);
+    let complete = matches!(sel, Some(Status::Complete));
+    let active = matches!(
+        sel,
+        Some(Status::Downloading | Status::Paused | Status::Queued | Status::Error)
+    );
+    let en = |id: usize, on: bool| {
+        SendMessageW(tb, TB_ENABLEBUTTON, Some(WPARAM(id)), Some(LPARAM(on as isize)));
+    };
+    en(ID_RESUME, active);
+    en(ID_STOP, active);
+    en(ID_STOP_ALL, !complete); // aktif saat tanpa seleksi / sedang unduh
+    en(ID_DELETE, sel.is_some());
+    // Add URL & Delete Completed selalu aktif.
 }
 
 /// Set teks status bar; pada tema gelap pakai owner-draw agar teks terbaca.
