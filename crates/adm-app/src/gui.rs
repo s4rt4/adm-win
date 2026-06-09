@@ -608,15 +608,6 @@ unsafe fn build_menus() {
     append(view, ID_TOOLBAR, w!("Toolbar"));
     append(view, ID_TRAY_ICON, w!("ADM tray icon"));
     append(view, ID_CUSTOMIZE, w!("Customize URL List..."));
-    sep(view);
-    let theme = CreatePopupMenu().unwrap();
-    append(theme, ID_THEME_DARK, w!("Dark"));
-    append(theme, ID_THEME_LIGHT, w!("Light"));
-    append(theme, ID_THEME_SYSTEM, w!("System"));
-    THEME_MENU.store(theme.0 as isize, Ordering::SeqCst);
-    popup(view, theme, w!("Theme"));
-    append(view, ID_FONT, w!("Font..."));
-    append(view, ID_LANGUAGE, w!("Language"));
 
     let help = CreatePopupMenu().unwrap();
     append(help, ID_HELP, w!("Help contents"));
