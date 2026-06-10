@@ -13,6 +13,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
+/// Gabungkan pesan error + seluruh rantai `source()` (mis. agar detail TLS
+/// "invalid peer certificate: UnknownIssuer" ikut, bukan hanya pesan dangkal
+/// reqwest "error sending request") — dipakai GUI untuk mendeteksi jenis error.
+fn error_chain<E: std::error::Error>(e: &E) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let part = s.to_string();
+        if !msg.contains(&part) {
+            msg.push_str(": ");
+            msg.push_str(&part);
+        }
+        src = s.source();
+    }
+    msg
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Queued { id: u64, url: String, output: PathBuf },
@@ -257,7 +274,7 @@ impl EngineHandle {
             let ev = match res {
                 Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
                 Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
-                Err(e) => EngineEvent::Failed { id, error: e.to_string() },
+                Err(e) => EngineEvent::Failed { id, error: error_chain(&e) },
             };
             (this.sink)(ev);
             if queued {
