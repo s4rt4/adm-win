@@ -76,3 +76,104 @@ async function sendToAdm(url, filename, referrer) {
     }
   });
 }
+
+// ===== Fase 1: deteksi video/audio progresif yang sedang diputar =====
+// Pantau respons jaringan; bila bertipe media progresif (mp4/webm/flv/mp3 dst),
+// catat per-tab & tampilkan panel "Download with ADM" via content script.
+const MEDIA_EXT = /\.(mp4|webm|flv|m4v|mov|mkv|mp3|m4a|aac|ogg|wav|3gp)(\?|$)/i;
+const MEDIA_CT = /^(video|audio)\//i;
+const MANIFEST_CT = /(mpegurl|dash\+xml)/i; // HLS/DASH = Fase 2, dilewati
+const MIN_SIZE = 200 * 1024; // lewati klip kecil/iklan
+
+// tabId -> Map(url -> {url, type, size, filename})
+const mediaByTab = new Map();
+
+function headerVal(headers, name) {
+  const h = (headers || []).find((x) => x.name.toLowerCase() === name);
+  return h ? h.value : undefined;
+}
+
+function extFromCt(ct) {
+  if (!ct) return null;
+  if (ct.includes("mp4")) return "mp4";
+  if (ct.includes("webm")) return "webm";
+  if (ct.includes("flv")) return "flv";
+  if (ct.includes("mpeg")) return "mp3";
+  if (ct.includes("3gpp")) return "3gp";
+  if (ct.includes("ogg")) return "ogg";
+  return null;
+}
+
+function guessName(url, ct) {
+  try {
+    const base = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+    if (base && /\.[a-z0-9]{2,4}$/i.test(base)) return base;
+  } catch (e) {
+    /* abaikan */
+  }
+  return `video.${extFromCt(ct) || "mp4"}`;
+}
+
+function containerOf(url, ct) {
+  const m = MEDIA_EXT.exec(url);
+  if (m) return m[1].toUpperCase();
+  return (extFromCt(ct) || "MEDIA").toUpperCase();
+}
+
+function pushToTab(tabId) {
+  const m = mediaByTab.get(tabId);
+  const items = m ? [...m.values()] : [];
+  chrome.tabs.sendMessage(tabId, { type: "adm-media", items }, () => void chrome.runtime.lastError);
+}
+
+function addMedia(tabId, item) {
+  let m = mediaByTab.get(tabId);
+  if (!m) {
+    m = new Map();
+    mediaByTab.set(tabId, m);
+  }
+  if (m.has(item.url)) return;
+  m.set(item.url, item);
+  pushToTab(tabId);
+}
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (d) => {
+    if (!enabled || d.tabId < 0) return;
+    const ct = (headerVal(d.responseHeaders, "content-type") || "").toLowerCase();
+    if (MANIFEST_CT.test(ct)) return; // streaming adaptif → belum didukung
+    const isMedia = (MEDIA_CT.test(ct) && !ct.includes("mp2t")) || MEDIA_EXT.test(d.url);
+    if (!isMedia) return;
+    let size = parseInt(headerVal(d.responseHeaders, "content-length") || "0", 10) || 0;
+    const cr = headerVal(d.responseHeaders, "content-range"); // total dari 206
+    if (cr) {
+      const mm = /\/(\d+)\s*$/.exec(cr);
+      if (mm) size = parseInt(mm[1], 10);
+    }
+    if (size && size < MIN_SIZE) return;
+    addMedia(d.tabId, {
+      url: d.url,
+      type: containerOf(d.url, ct),
+      size,
+      filename: guessName(d.url, ct),
+    });
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
+);
+
+// Bersihkan daftar saat tab navigasi/ditutup.
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === "loading") mediaByTab.delete(tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => mediaByTab.delete(tabId));
+
+// Pesan dari content script: minta daftar / minta unduh item terpilih.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || !sender.tab) return;
+  if (msg.type === "adm-get-media") {
+    pushToTab(sender.tab.id);
+  } else if (msg.type === "adm-download" && msg.url) {
+    sendToAdm(msg.url, msg.filename, sender.tab.url);
+  }
+});
