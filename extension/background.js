@@ -31,7 +31,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // Klik kanan pada link → kirim ke ADM (selalu, walau toggle off).
 chrome.contextMenus.onClicked.addListener((info) => {
   const url = info.linkUrl || info.srcUrl;
-  if (url) sendToAdm(url);
+  if (url) sendToAdm(url, undefined, info.pageUrl);
 });
 
 // Tangkap unduhan baru: batalkan di browser, serahkan ke ADM.
@@ -46,13 +46,30 @@ chrome.downloads.onCreated.addListener(async (item) => {
     /* sudah selesai/tak bisa dibatalkan — abaikan */
   }
   const filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
-  sendToAdm(url, filename);
+  sendToAdm(url, filename, item.referrer);
 });
 
-function sendToAdm(url, filename) {
+// Kumpulkan Cookie header untuk URL agar unduhan ber-autentikasi (mis. lampiran
+// Gmail) bisa diunduh ADM. Mengembalikan string "k=v; k2=v2" atau "".
+async function cookieHeaderFor(url) {
+  try {
+    const cookies = await chrome.cookies.getAll({ url });
+    if (cookies && cookies.length) {
+      return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    }
+  } catch (e) {
+    /* tak ada izin / gagal — abaikan, unduh tanpa cookie */
+  }
+  return "";
+}
+
+async function sendToAdm(url, filename, referrer) {
   if (isDuplicate(url)) return;
-  const msg = { method: "download.add", url };
+  const msg = { method: "download.add", url, userAgent: navigator.userAgent };
   if (filename) msg.filename = filename;
+  if (referrer) msg.referrer = referrer;
+  const cookie = await cookieHeaderFor(url);
+  if (cookie) msg.cookies = cookie;
   chrome.runtime.sendNativeMessage(HOST, msg, () => {
     if (chrome.runtime.lastError) {
       console.warn("ADM bridge:", chrome.runtime.lastError.message);

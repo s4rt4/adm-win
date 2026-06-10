@@ -6,7 +6,7 @@ use crate::limiter::Limiter;
 use crate::sidecar::{self, SegRecord, Sidecar};
 use crate::{platform, probe};
 use futures_util::StreamExt;
-use reqwest::header::RANGE;
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, RANGE, REFERER};
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +38,10 @@ pub struct DownloadRequest {
     pub connections: usize,
     /// Abaikan verifikasi sertifikat TLS (server bersertifikat invalid).
     pub insecure: bool,
+    /// Header titipan browser (untuk unduhan ber-autentikasi seperti Gmail).
+    pub referrer: Option<String>,
+    pub user_agent: Option<String>,
+    pub cookies: Option<String>,
 }
 
 /// Snapshot progres untuk callback.
@@ -87,12 +91,38 @@ impl SegState {
     }
 }
 
-fn build_client(insecure: bool) -> Result<Client> {
+/// Header titipan browser untuk unduhan ber-autentikasi (referrer/UA/cookie).
+#[derive(Default, Clone)]
+pub struct ReqHeaders {
+    pub referrer: Option<String>,
+    pub user_agent: Option<String>,
+    pub cookies: Option<String>,
+}
+
+fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
+    let ua = h
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| concat!("ADM/", env!("CARGO_PKG_VERSION")).to_string());
     let mut b = Client::builder()
-        .user_agent(concat!("ADM/", env!("CARGO_PKG_VERSION")))
+        .user_agent(ua)
         // Jangan simpan koneksi idle (probe singkat tak meninggalkan keep-alive
         // yang menggantung; tiap segmen pakai koneksi sendiri).
         .pool_max_idle_per_host(0);
+    let mut headers = HeaderMap::new();
+    if let Some(r) = &h.referrer {
+        if let Ok(v) = HeaderValue::from_str(r) {
+            headers.insert(REFERER, v);
+        }
+    }
+    if let Some(c) = &h.cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            headers.insert(COOKIE, v);
+        }
+    }
+    if !headers.is_empty() {
+        b = b.default_headers(headers);
+    }
     if insecure {
         // User memilih "terima risiko": jangan verifikasi sertifikat TLS.
         b = b.danger_accept_invalid_certs(true);
@@ -100,16 +130,21 @@ fn build_client(insecure: bool) -> Result<Client> {
     Ok(b.build()?)
 }
 
-/// Probe ringan satu URL (bangun client sendiri) — untuk resolusi nama berkas
-/// (Content-Disposition) sebelum mulai mengunduh.
+/// Probe ringan satu URL (client default tanpa header titipan).
 pub async fn probe_url(url: &str) -> Result<probe::Probe> {
-    let client = build_client(false)?;
+    probe_url_with(url, &ReqHeaders::default(), false).await
+}
+
+/// Probe dengan header titipan browser (referrer/UA/cookie) + opsi insecure —
+/// agar unduhan ber-autentikasi (Gmail dll) memberi ukuran & Content-Disposition.
+pub async fn probe_url_with(url: &str, h: &ReqHeaders, insecure: bool) -> Result<probe::Probe> {
+    let client = build_client(insecure, h)?;
     probe::probe(&client, url).await
 }
 
 /// Unduh isi sebuah halaman sebagai teks (dipakai site grabber).
 pub async fn fetch_text(url: &str) -> Result<String> {
-    let client = build_client(false)?;
+    let client = build_client(false, &ReqHeaders::default())?;
     let resp = client.get(url).send().await?.error_for_status()?;
     Ok(resp.text().await?)
 }
@@ -123,7 +158,12 @@ pub async fn download(
     per_limiter: Arc<Limiter>,
     global_limiter: Arc<Limiter>,
 ) -> Result<Outcome> {
-    let client = build_client(req.insecure)?;
+    let headers = ReqHeaders {
+        referrer: req.referrer.clone(),
+        user_agent: req.user_agent.clone(),
+        cookies: req.cookies.clone(),
+    };
+    let client = build_client(req.insecure, &headers)?;
     let pr = probe::probe(&client, &req.url).await?;
     let sidecar_path = sidecar::path_for(&req.output);
 

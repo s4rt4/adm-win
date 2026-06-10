@@ -16,8 +16,8 @@ mod probe;
 mod sidecar;
 
 pub use download::{
-    download, fetch_text, probe_url, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb,
-    SegmentProgress,
+    download, fetch_text, probe_url, probe_url_with, CancelToken, DownloadRequest, Outcome,
+    Progress, ProgressCb, ReqHeaders, SegmentProgress,
 };
 pub use error::{Error, Result};
 pub use grabber::{extract_links, grab_links};

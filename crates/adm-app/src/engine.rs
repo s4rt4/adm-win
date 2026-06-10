@@ -70,6 +70,9 @@ pub struct EngineHandle {
     queue: Arc<Mutex<QueueState>>,
     /// Limiter global (dibagi semua unduhan); live-adjustable.
     global_limiter: Arc<Limiter>,
+    /// Metadata titipan browser per-id (referrer/UA/cookie) untuk resume; sesi
+    /// saja (tak dipersist — cookie sensitif & URL/ sesi cepat kedaluwarsa).
+    meta: Arc<Mutex<HashMap<u64, DownloadAddParams>>>,
 }
 
 impl EngineHandle {
@@ -87,6 +90,7 @@ impl EngineHandle {
                 running_ids: HashSet::new(),
             })),
             global_limiter: Arc::new(Limiter::unlimited()),
+            meta: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -150,11 +154,26 @@ impl EngineHandle {
     }
 
     /// Lanjutkan unduhan yang sudah ada (segera). `insecure` mengabaikan
-    /// verifikasi sertifikat TLS (server bersertifikat invalid).
+    /// verifikasi sertifikat TLS. Header titipan (referrer/UA/cookie) diambil
+    /// dari metadata sesi bila masih ada.
     pub fn resume(&self, id: u64, url: String, filename: String, insecure: bool) {
+        let (referrer, user_agent, cookies) = self
+            .meta
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|m| (m.referrer.clone(), m.user_agent.clone(), m.cookies.clone()))
+            .unwrap_or_default();
         self.start(
             id,
-            DownloadAddParams { url, filename: Some(filename), insecure, ..Default::default() },
+            DownloadAddParams {
+                url,
+                filename: Some(filename),
+                insecure,
+                referrer,
+                user_agent,
+                cookies,
+            },
             false,
         );
     }
@@ -220,6 +239,8 @@ impl EngineHandle {
     }
 
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
+        // Simpan metadata titipan (referrer/UA/cookie) agar resume bisa pakai lagi.
+        self.meta.lock().unwrap().insert(id, params.clone());
         let cancel = CancelToken::new();
         let per_limiter = Arc::new(Limiter::unlimited());
         self.active
@@ -267,6 +288,9 @@ impl EngineHandle {
                 output,
                 connections: 8,
                 insecure: params.insecure,
+                referrer: params.referrer.clone(),
+                user_agent: params.user_agent.clone(),
+                cookies: params.cookies.clone(),
             };
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
             this.active.lock().unwrap().remove(&id);
@@ -298,7 +322,12 @@ impl EngineHandle {
                 return p.clone();
             }
         }
-        if let Ok(pr) = adm_core::probe_url(&params.url).await {
+        let headers = adm_core::ReqHeaders {
+            referrer: params.referrer.clone(),
+            user_agent: params.user_agent.clone(),
+            cookies: params.cookies.clone(),
+        };
+        if let Ok(pr) = adm_core::probe_url_with(&params.url, &headers, params.insecure).await {
             if let Some(cd) = pr.suggested_filename {
                 let cd = sanitize(&cd);
                 if !cd.is_empty() && !looks_generic(&cd) {
