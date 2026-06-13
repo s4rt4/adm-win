@@ -10,8 +10,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-authors = ["ADM"]
+license = "MIT"
+authors = ["s4rt4 <surat.sarta@gmail.com>"]
 
 # Profil rilis: binary kecil (sesuai sasaran §1 — footprint minimum).
 [profile.release]
