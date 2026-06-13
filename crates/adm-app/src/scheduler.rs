@@ -174,9 +174,14 @@ pub fn show(parent: HWND) {
         DONE.store(false, Ordering::SeqCst);
         SAVED.store(false, Ordering::SeqCst);
 
+        // Ukuran CLIENT diinginkan → window dibesarkan agar tombol OK/Cancel di
+        // bawah tidak terpotong caption/border.
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: 380, bottom: 252 };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
         let mut pr = RECT::default();
         let _ = GetWindowRect(parent, &mut pr);
-        let (dw, dh) = (380, 280);
         let x = (pr.left + ((pr.right - pr.left) - dw) / 2).max(0);
         let y = (pr.top + ((pr.bottom - pr.top) - dh) / 2).max(0);
 
@@ -184,7 +189,7 @@ pub fn show(parent: HWND) {
             WS_EX_DLGMODALFRAME,
             CLASS,
             w!("Scheduler"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             x, y, dw, dh,
             Some(parent),
             None,
