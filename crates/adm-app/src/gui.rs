@@ -325,6 +325,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 update_theme_checks();
                 update_toolbar_state(); // mulai: tanpa seleksi
                 layout(hwnd);
+                refresh_ui(hwnd); // render daftar yang dipulihkan dari disk
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
