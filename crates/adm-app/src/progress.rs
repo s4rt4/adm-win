@@ -468,8 +468,11 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_CTLCOLORSTATIC => {
+                // Label berada di atas tab control (badan putih saat bertema);
+                // pakai brush window (putih) + teks transparan agar menyatu,
+                // bukan kotak abu-abu (COLOR_BTNFACE).
                 SetBkMode(HDC(wparam.0 as *mut _), TRANSPARENT);
-                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
