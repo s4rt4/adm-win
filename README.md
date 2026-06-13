@@ -2,12 +2,6 @@
   <img src="banner.png" alt="Alpha Download Manager" width="100%">
 </p>
 
-<h1 align="center">Alpha Download Manager (ADM)</h1>
-
-<p align="center">
-  A fast, native Windows download manager written from scratch in Rust — an IDM-style experience without the bloat.
-</p>
-
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Platform: Windows">
