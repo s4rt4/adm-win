@@ -281,7 +281,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            980,
+            1100,
             600,
             None,
             None,
