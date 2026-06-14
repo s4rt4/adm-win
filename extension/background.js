@@ -98,7 +98,8 @@ function extFromCt(ct) {
   if (ct.includes("mp4")) return "mp4";
   if (ct.includes("webm")) return "webm";
   if (ct.includes("flv")) return "flv";
-  if (ct.includes("mpeg")) return "mp3";
+  if (ct.includes("audio/mpeg")) return "mp3";
+  if (ct.includes("mpeg")) return "mpg"; // video/mpeg, bukan mp3
   if (ct.includes("3gpp")) return "3gp";
   if (ct.includes("ogg")) return "ogg";
   return null;

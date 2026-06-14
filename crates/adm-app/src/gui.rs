@@ -1545,23 +1545,35 @@ unsafe fn refresh_ui(hwnd: HWND) {
 
     update_toolbar_state();
 
-    // Unduhan baru selesai: tutup dialog status (tak diperlukan lagi), lalu
-    // tampilkan dialog "Download complete" (§9.14).
-    let show_complete = crate::settings::get().show_complete_dialog;
-    for row in store::take_newly_completed() {
-        crate::progress::close_for(row.id);
-        if show_complete {
-            crate::progress::show_complete(hwnd, &row);
+    // Dialog complete & popup failed menjalankan message-loop modal sendiri;
+    // selama loop itu, WM_PROGRESS lain bisa masuk dan memanggil refresh_ui lagi
+    // (rekursif) → tanpa guard, dialog bisa bertumpuk. IN_POPUP memastikan hanya
+    // satu lapis yang menampilkan popup, dan menguras semua secara berurutan.
+    if !IN_POPUP.swap(true, Ordering::SeqCst) {
+        let show_complete = crate::settings::get().show_complete_dialog;
+        loop {
+            let completed = store::take_newly_completed();
+            let failed = store::take_newly_failed();
+            if completed.is_empty() && failed.is_empty() {
+                break;
+            }
+            for row in completed {
+                crate::progress::close_for(row.id); // unduhan selesai → tutup dialog status
+                if show_complete {
+                    crate::progress::show_complete(hwnd, &row);
+                }
+            }
+            for row in failed {
+                crate::progress::close_for(row.id); // mis. link kedaluwarsa → tawarkan Refresh Link
+                show_failed_popup(hwnd, &row);
+            }
         }
-    }
-
-    // Unduhan gagal (mis. link kedaluwarsa): tutup dialog status, tawarkan
-    // Refresh Link.
-    for row in store::take_newly_failed() {
-        crate::progress::close_for(row.id);
-        show_failed_popup(hwnd, &row);
+        IN_POPUP.store(false, Ordering::SeqCst);
     }
 }
+
+/// Guard agar popup complete/failed tak bertumpuk saat refresh_ui re-entrant.
+static IN_POPUP: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable tombol toolbar sesuai seleksi & status (mirip §9.3 File menu).
 unsafe fn update_toolbar_state() {

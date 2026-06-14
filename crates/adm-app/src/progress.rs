@@ -431,8 +431,10 @@ unsafe fn refresh(dlg: HWND) {
         }
     }
     for (i, (start, end, dl)) in r.segments.iter().enumerate() {
-        let len = end - start + 1;
-        let seg_pct = (dl * 100).checked_div(len).unwrap_or(0);
+        // saturating: data segmen datang dari luar (sidecar/engine); end<start
+        // atau overflow tak boleh memanik proses (panic=abort).
+        let len = (*end).saturating_sub(*start) + 1;
+        let seg_pct = (*dl).saturating_mul(100).checked_div(len).unwrap_or(0);
         conn_set(d.conn, i as i32, 1, &fmt_size(Some(*dl)));
         conn_set(d.conn, i as i32, 2, &format!("{seg_pct}%"));
     }
@@ -580,7 +582,7 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
     if let Some(r) = store::get(id) {
         if let Some(total) = r.size.filter(|t| *t > 0) {
             for (i, (start, end, dl)) in r.segments.iter().enumerate() {
-                let len = (end - start + 1) as i64;
+                let len = ((*end).saturating_sub(*start) + 1) as i64;
                 let x0 = (*start as i64 * w as i64 / total as i64) as i32;
                 let x1 = ((*end as i64 + 1) * w as i64 / total as i64) as i32;
                 let filled = if len > 0 {
