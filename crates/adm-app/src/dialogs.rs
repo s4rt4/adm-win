@@ -144,10 +144,17 @@ fn dialog_impl(
         let _ = AdjustWindowRectEx(&mut rcsz, style, false, WS_EX_DLGMODALFRAME);
         let (dw, dh) = (rcsz.right - rcsz.left, rcsz.bottom - rcsz.top);
 
-        let mut pr = RECT::default();
-        let _ = GetWindowRect(parent, &mut pr);
-        let x = pr.left + ((pr.right - pr.left) - dw) / 2;
-        let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
+        // Pusatkan di AREA KERJA MONITOR (bukan rect parent — saat dipicu browser,
+        // jendela utama bisa minimized/tersembunyi → koordinatnya di luar layar).
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mon = MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST);
+        let area = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        };
+        let x = area.left + ((area.right - area.left) - dw) / 2;
+        let y = area.top + ((area.bottom - area.top) - dh) / 2;
 
         let title = if with_filename { w!("Download File Info") } else { w!("Add new download") };
         let dlg = CreateWindowExW(

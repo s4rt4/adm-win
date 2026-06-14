@@ -12,7 +12,10 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F3};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, SetActiveWindow, SetFocus, VK_DELETE, VK_F3,
+};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -2191,8 +2194,28 @@ fn request_exit(hwnd: HWND) {
 
 fn show_window(hwnd: HWND) {
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        force_foreground(hwnd);
+    }
+}
+
+/// Bawa jendela benar-benar ke depan meski proses lain (browser) sedang
+/// foreground — Windows menolak SetForegroundWindow langsung & hanya mengedip
+/// taskbar. Trik: tempel input-thread foreground sesaat agar diizinkan.
+unsafe fn force_foreground(hwnd: HWND) {
+    let fg = GetForegroundWindow();
+    let cur = GetCurrentThreadId();
+    let other = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+    let attached = other != 0 && other != cur && AttachThreadInput(cur, other, true).as_bool();
+    let _ = BringWindowToTop(hwnd);
+    let _ = SetForegroundWindow(hwnd);
+    let _ = SetActiveWindow(hwnd);
+    if attached {
+        let _ = AttachThreadInput(cur, other, false);
     }
 }
 
