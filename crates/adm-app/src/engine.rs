@@ -178,6 +178,14 @@ impl EngineHandle {
         );
     }
 
+    /// Masukkan kembali item Queued yang dipulihkan dari disk ke antrian engine
+    /// (memakai id yang sudah ada; baris di store tak dibuat ulang). Tanpa ini,
+    /// "Start queue" tak memproses item Queued setelah aplikasi di-restart.
+    pub fn requeue(&self, id: u64, params: DownloadAddParams) {
+        self.queue.lock().unwrap().pending.push_back((id, params));
+        self.pump();
+    }
+
     /// Tambahkan ke antrian ("Download Later"); jalan saat queue running & ada slot.
     pub fn enqueue(&self, params: DownloadAddParams) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);

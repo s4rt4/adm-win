@@ -321,6 +321,16 @@ async fn run_segment(
         .await?
         .error_for_status()?;
 
+    // Segmen non-awal WAJIB dapat 206 Partial Content. Bila server mengabaikan
+    // Range dan membalas 200 (body penuh dari byte 0), menulisnya di offset
+    // segmen akan MERUSAK berkas — gagalkan dengan jelas, jangan korup.
+    if begin > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(Error::Other(format!(
+            "server mengabaikan Range (status {}); unduhan multi-segmen dibatalkan",
+            resp.status().as_u16()
+        )));
+    }
+
     let file = platform::open_writer(&output)?;
     let mut offset = begin;
     let mut stream = resp.bytes_stream();

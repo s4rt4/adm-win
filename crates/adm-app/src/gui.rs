@@ -2128,10 +2128,18 @@ unsafe fn apply_theme(hwnd: HWND) {
         let _ = InvalidateRect(Some(tv), None, true);
     }
     if let Some(tb) = state::load_hwnd(&state::TOOLBAR_HWND) {
+        // Destroy imagelist lama (yang dikembalikan TB_SETIMAGELIST) agar tak
+        // bocor tiap ganti tema / WM_SETTINGCHANGE.
         let himl = build_toolbar_imagelist(dark);
-        SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
+        let old1 = SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
+        if old1.0 != 0 && old1.0 != himl.0 {
+            let _ = ImageList_Destroy(Some(HIMAGELIST(old1.0)));
+        }
         let diml = build_disabled_imagelist();
-        SendMessageW(tb, TB_SETDISABLEDIMAGELIST, Some(WPARAM(0)), Some(LPARAM(diml.0)));
+        let old2 = SendMessageW(tb, TB_SETDISABLEDIMAGELIST, Some(WPARAM(0)), Some(LPARAM(diml.0)));
+        if old2.0 != 0 && old2.0 != diml.0 {
+            let _ = ImageList_Destroy(Some(HIMAGELIST(old2.0)));
+        }
         let _ = InvalidateRect(Some(tb), None, true);
     }
     if let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) {

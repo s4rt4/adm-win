@@ -86,6 +86,21 @@ pub fn run() {
     // Pulihkan daftar unduhan yang persist; setel id engine agar tak bentrok.
     let max_id = store::load();
     engine.reserve_ids(max_id + 1);
+    // Item Queued yang dipulihkan harus kembali masuk antrian engine agar
+    // "Start queue" memprosesnya (engine.pending tak ikut dipersist).
+    store::with_rows(|rows| {
+        for r in rows.iter().filter(|r| r.status == store::Status::Queued) {
+            engine.requeue(
+                r.id,
+                adm_ipc::DownloadAddParams {
+                    url: r.url.clone(),
+                    filename: Some(r.filename()),
+                    insecure: r.insecure,
+                    ..Default::default()
+                },
+            );
+        }
+    });
     gui::set_engine(engine.clone());
     scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)
 
