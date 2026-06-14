@@ -22,6 +22,7 @@ const ID_DIR: usize = 1;
 const ID_QUEUE: usize = 2;
 const ID_LIMIT: usize = 3;
 const ID_AUTOSTART: usize = 4;
+const ID_BROWSE: usize = 10;
 const ID_OK: usize = 20;
 const ID_CANCEL: usize = 21;
 
@@ -130,10 +131,11 @@ pub fn show(parent: HWND) {
         const FW: i32 = 420; // lebar penuh (folder)
         const EH: i32 = 24; // tinggi field
 
-        // Folder unduhan (label di atas, field selebar dialog).
+        // Folder unduhan (label di atas, field + tombol Browse).
         let _ = mk(dlg, w!("STATIC"), w!("Download folder:"), WINDOW_STYLE(0), M, 16, 200, 16, 0);
-        let d = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32), M, 36, FW, EH, ID_DIR);
+        let d = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32), M, 36, FW - 86, EH, ID_DIR);
         set_text(d, &dir);
+        let _ = mk(dlg, w!("BUTTON"), w!("Browse..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), M + FW - 80, 35, 80, EH + 2, ID_BROWSE);
         set_ctrl(0, d);
 
         // Maksimum unduhan simultan (label kiri, field numerik kanan).
@@ -213,6 +215,11 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     ID_CANCEL => {
                         DONE.store(true, Ordering::SeqCst);
                         let _ = DestroyWindow(hwnd);
+                    }
+                    ID_BROWSE => {
+                        if let Some(p) = crate::tasks::pick_folder(hwnd, "Pilih folder unduhan") {
+                            set_text(ctrl(0), &p.to_string_lossy());
+                        }
                     }
                     _ => {}
                 }

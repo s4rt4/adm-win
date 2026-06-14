@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_DELETE, VK_F3};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -21,6 +21,11 @@ static ENGINE: OnceLock<EngineHandle> = OnceLock::new();
 static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// HMENU submenu Theme (untuk radio-check).
 static THEME_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Label "empty state" yang tampil saat daftar kosong (di atas ListView).
+static EMPTY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Kolom sort aktif (-1 = urutan store) + arah naik.
+static SORT_COL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static SORT_ASC: AtomicBool = AtomicBool::new(true);
 /// Tema gelap aktif (dibaca WndProc untuk custom-draw).
 static DARK: AtomicBool = AtomicBool::new(false);
 static STATUS_TEXT: Mutex<String> = Mutex::new(String::new());
@@ -294,6 +299,15 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(big.0 as isize)));
 
+        // Sudut jendela membulat (Win11; no-op di Win10).
+        let corner = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+
         add_tray_icon(hwnd);
 
         if !start_hidden {
@@ -301,10 +315,21 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             let _ = UpdateWindow(hwnd);
         }
 
+        // Akselerator keyboard global (Ctrl+N add, Ctrl+F find, F3 next, Del hapus).
+        let accels = [
+            ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'N' as u16, cmd: ID_ADD as u16 },
+            ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'F' as u16, cmd: ID_FIND as u16 },
+            ACCEL { fVirt: FVIRTKEY, key: VK_F3.0, cmd: ID_FIND_NEXT as u16 },
+            ACCEL { fVirt: FVIRTKEY, key: VK_DELETE.0, cmd: ID_REMOVE as u16 },
+        ];
+        let haccel = CreateAcceleratorTableW(&accels).unwrap_or_default();
+
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+            if TranslateAcceleratorW(hwnd, haccel, &message) == 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
         Ok(())
     }
@@ -382,6 +407,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 {
                     return toolbar_customdraw(lparam);
                 }
+                if hdr.code == NM_CUSTOMDRAW && from == state::load_hwnd(&state::LIST_HWND) {
+                    return list_customdraw(lparam);
+                }
                 handle_notify(hwnd, lparam);
                 LRESULT(0)
             }
@@ -397,6 +425,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else {
                     DefWindowProcW(hwnd, msg, wparam, lparam)
                 }
+            }
+            WM_CTLCOLORSTATIC if lparam.0 == EMPTY_HWND.load(Ordering::SeqCst) => {
+                // Label empty-state berada di atas ListView putih → samakan latar.
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, rgb(140, 140, 140));
+                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
             }
             WM_DRAWITEM => {
                 let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
@@ -513,7 +548,28 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
         Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize)),
     );
     add_list_columns(lv);
+    // Ikon tipe-file sistem (DPI-aware) di kolom File Name.
+    let sysil = system_image_list();
+    if sysil != 0 {
+        SendMessageW(lv, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(sysil)));
+    }
     state::store_hwnd(&state::LIST_HWND, lv);
+
+    // Label "empty state" (di atas ListView; tampil saat daftar kosong).
+    let empty = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("STATIC"),
+        w!("Belum ada unduhan.\r\nKlik \u{201C}Add URL\u{201D} atau tarik tautan dari browser untuk memulai."),
+        WS_CHILD | WINDOW_STYLE(0x0000_0001), // SS_CENTER
+        0, 0, 0, 0,
+        Some(hwnd),
+        None,
+        Some(instance),
+        None,
+    )
+    .unwrap_or_default();
+    set_font(empty);
+    EMPTY_HWND.store(empty.0 as isize, Ordering::SeqCst);
 
     // Status bar.
     let sb = CreateWindowExW(
@@ -580,6 +636,14 @@ unsafe fn layout(hwnd: HWND) {
     }
     if let Some(lv) = lv {
         let _ = MoveWindow(lv, split, top, rc.right - split, bottom - top, true);
+    }
+    // Label empty-state: di tengah area ListView (2 baris).
+    let eh = EMPTY_HWND.load(Ordering::SeqCst);
+    if eh != 0 {
+        let e = HWND(eh as *mut core::ffi::c_void);
+        let h = 44;
+        let y = top + ((bottom - top) - h).max(0) / 2;
+        let _ = MoveWindow(e, split + 20, y, (rc.right - split - 40).max(0), h, true);
     }
 }
 
@@ -761,12 +825,47 @@ const COL_DEFS: [(&str, i32); 8] = [
 /// Visibilitas kolom (View ▸ Customize URL List). Kolom 0 selalu tampil.
 static COL_VISIBLE: Mutex<[bool; 8]> = Mutex::new([true; 8]);
 
+/// Handle imagelist ikon sistem (kecil, DPI-aware). Shared — JANGAN di-destroy.
+unsafe fn system_image_list() -> isize {
+    let mut shfi = SHFILEINFOW::default();
+    let attr = windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x80); // NORMAL
+    SHGetFileInfoW(
+        w!("x.txt"),
+        attr,
+        Some(&mut shfi),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+    ) as isize
+}
+
+/// Indeks ikon sistem untuk nama berkas (tanpa perlu berkasnya ada).
+unsafe fn file_icon_index(name: &str) -> i32 {
+    let h = HSTRING::from(name);
+    let mut shfi = SHFILEINFOW::default();
+    let attr = windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x80);
+    SHGetFileInfoW(
+        PCWSTR(h.as_ptr()),
+        attr,
+        Some(&mut shfi),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+    );
+    shfi.iIcon
+}
+
 unsafe fn add_list_columns(lv: HWND) {
     for (i, (title, width)) in COL_DEFS.iter().enumerate() {
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         wide.push(0);
+        // Kolom numerik rata-kanan; Q di tengah. (Kolom 0 selalu kiri — batasan LV.)
+        let fmt = match i {
+            1 => LVCFMT_CENTER,
+            2 | 4 | 5 => LVCFMT_RIGHT,
+            _ => LVCFMT_LEFT,
+        };
         let mut col = LVCOLUMNW {
-            mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+            mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT,
+            fmt,
             cx: *width,
             pszText: PWSTR(wide.as_mut_ptr()),
             iSubItem: i as i32,
@@ -791,10 +890,11 @@ unsafe fn insert_row(lv: HWND, item: i32, text: &str, id: u64) {
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     wide.push(0);
     let mut lvi = LVITEMW {
-        mask: LVIF_TEXT | LVIF_PARAM,
+        mask: LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE,
         iItem: item,
         iSubItem: 0,
         pszText: PWSTR(wide.as_mut_ptr()),
+        iImage: file_icon_index(text),
         lParam: LPARAM(id as isize),
         ..Default::default()
     };
@@ -818,11 +918,31 @@ unsafe fn item_id(lv: HWND, index: i32) -> Option<u64> {
 
 unsafe fn refresh_list(lv: HWND) {
     let filter = FILTER.load(Ordering::Relaxed);
-    let visible: Vec<store::Row> =
+    let mut visible: Vec<store::Row> =
         store::with_rows(|rows| rows.iter().filter(|r| filter_match(filter, r)).cloned().collect());
 
-    let count = SendMessageW(lv, LVM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
-    let rebuild = count != visible.len();
+    // Urutkan bila ada kolom sort aktif (klik header).
+    let col = SORT_COL.load(Ordering::SeqCst);
+    if col >= 0 {
+        sort_rows(&mut visible, col);
+        if !SORT_ASC.load(Ordering::SeqCst) {
+            visible.reverse();
+        }
+    }
+
+    // Empty-state: tampilkan label bila tak ada baris (di filter aktif).
+    let eh = EMPTY_HWND.load(Ordering::SeqCst);
+    if eh != 0 {
+        let show = if visible.is_empty() { SW_SHOW } else { SW_HIDE };
+        let _ = ShowWindow(HWND(eh as *mut core::ffi::c_void), show);
+    }
+
+    // Rebuild hanya bila jumlah ATAU urutan id berubah (cegah flicker tiap tick,
+    // dan jaga lParam item tetap cocok dengan baris yang ditampilkan).
+    let count = SendMessageW(lv, LVM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as i32;
+    let cur_ids: Vec<u64> = (0..count).filter_map(|i| item_id(lv, i)).collect();
+    let want_ids: Vec<u64> = visible.iter().map(|r| r.id).collect();
+    let rebuild = cur_ids != want_ids;
     if rebuild {
         SendMessageW(lv, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
     }
@@ -837,6 +957,18 @@ unsafe fn refresh_list(lv: HWND) {
         set_subitem(lv, idx, 3, &status_text(r));
         set_subitem(lv, idx, 4, &fmt_eta(r.eta_secs()));
         set_subitem(lv, idx, 5, &fmt_speed(r.speed_bps));
+    }
+}
+
+/// Urutkan (naik) baris menurut kolom yang diklik.
+fn sort_rows(rows: &mut [store::Row], col: i32) {
+    match col {
+        0 => rows.sort_by_key(|r| r.filename().to_lowercase()),
+        2 => rows.sort_by_key(|r| r.size.unwrap_or(0)),
+        3 => rows.sort_by_key(|r| r.status.label()),
+        4 => rows.sort_by_key(|r| r.eta_secs().unwrap_or(u64::MAX)),
+        5 => rows.sort_by_key(|r| r.speed_bps),
+        _ => {}
     }
 }
 
@@ -881,6 +1013,18 @@ unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
                 show_context_menu(hwnd);
             }
             LVN_ITEMCHANGED => update_toolbar_state(), // seleksi berubah
+            LVN_COLUMNCLICK => {
+                let nm = &*(lparam.0 as *const NMLISTVIEW);
+                let col = nm.iSubItem;
+                if SORT_COL.load(Ordering::SeqCst) == col {
+                    let asc = SORT_ASC.load(Ordering::SeqCst);
+                    SORT_ASC.store(!asc, Ordering::SeqCst);
+                } else {
+                    SORT_COL.store(col, Ordering::SeqCst);
+                    SORT_ASC.store(true, Ordering::SeqCst);
+                }
+                refresh_ui(hwnd);
+            }
             _ => {}
         }
     } else if Some(hdr.hwndFrom) == tb && hdr.code == TBN_DROPDOWN {
@@ -893,6 +1037,54 @@ unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
         let _ = TrackPopupMenu(menu, TPM_LEFTALIGN, pt.x, pt.y, Some(0), hwnd, None);
         let _ = DestroyMenu(menu);
     }
+}
+
+/// Custom-draw kolom Status (subitem 3): bar progres + persen untuk unduhan
+/// aktif. Defensif (tanpa unwrap/underflow) — area paint pernah jadi sumber crash.
+unsafe fn list_customdraw(lparam: LPARAM) -> LRESULT {
+    let p = &*(lparam.0 as *const NMLVCUSTOMDRAW);
+    let stage = p.nmcd.dwDrawStage.0;
+    if stage == CDDS_PREPAINT.0 {
+        return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
+    }
+    if stage == CDDS_ITEMPREPAINT.0 {
+        return LRESULT(CDRF_NOTIFYSUBITEMDRAW as isize);
+    }
+    let dodefault = LRESULT(CDRF_DODEFAULT as isize);
+    if stage != (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) || p.iSubItem != 3 {
+        return dodefault;
+    }
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return dodefault };
+    let idx = p.nmcd.dwItemSpec as i32;
+    let Some(id) = item_id(lv, idx) else { return dodefault };
+    let Some(row) = store::get(id) else { return dodefault };
+    if row.status != store::Status::Downloading {
+        return dodefault;
+    }
+    let Some(total) = row.size.filter(|t| *t > 0) else { return dodefault };
+    let pct = (row.downloaded.saturating_mul(100) / total).min(100) as i32;
+
+    // Rect sel subitem (LVIR_BOUNDS=0, top=indeks subitem).
+    let mut r = RECT { left: 0, top: 3, ..Default::default() };
+    SendMessageW(lv, LVM_GETSUBITEMRECT, Some(WPARAM(idx as usize)), Some(LPARAM(&mut r as *mut _ as isize)));
+    let mut bar = RECT { left: r.left + 3, top: r.top + 2, right: r.right - 3, bottom: r.bottom - 2 };
+    if bar.right <= bar.left || bar.bottom <= bar.top {
+        return dodefault;
+    }
+    let hdc = p.nmcd.hdc;
+    let track = CreateSolidBrush(rgb(228, 228, 228));
+    FillRect(hdc, &bar, track);
+    let _ = DeleteObject(track.into());
+    let w = bar.right - bar.left;
+    let fill_rc = RECT { right: bar.left + w * pct / 100, ..bar };
+    let green = CreateSolidBrush(rgb(59, 160, 90));
+    FillRect(hdc, &fill_rc, green);
+    let _ = DeleteObject(green.into());
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, rgb(20, 20, 20));
+    let mut wide: Vec<u16> = format!("{pct}%").encode_utf16().collect();
+    DrawTextW(hdc, &mut wide, &mut bar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    LRESULT(CDRF_SKIPDEFAULT as isize)
 }
 
 unsafe fn select_item(lv: HWND, item: i32) {
@@ -1535,7 +1727,13 @@ unsafe fn refresh_ui(hwnd: HWND) {
     }
     let total = store::len();
     let active = store::active_count();
-    set_status_bar(&format!("{total} unduhan — {active} aktif"));
+    let speed: u64 = store::with_rows(|rows| {
+        rows.iter()
+            .filter(|r| r.status == store::Status::Downloading)
+            .map(|r| r.speed_bps)
+            .sum()
+    });
+    update_status(total, active, speed);
     // Judul.
     let title = if active == 0 {
         "Alpha Download Manager".to_string()
@@ -1562,7 +1760,8 @@ unsafe fn refresh_ui(hwnd: HWND) {
             for row in completed {
                 crate::progress::close_for(row.id); // unduhan selesai → tutup dialog status
                 if show_complete {
-                    crate::progress::show_complete(hwnd, &row);
+                    // Toast non-modal (bukan dialog modal yang menyela).
+                    notify_balloon(hwnd, "Download selesai", &row.filename());
                 }
             }
             for row in failed {
@@ -1599,6 +1798,42 @@ unsafe fn update_toolbar_state() {
 }
 
 /// Set teks status bar; pada tema gelap pakai owner-draw agar teks terbaca.
+/// Status bar 3 bagian (terang): ringkasan • kecepatan total • jumlah aktif.
+fn update_status(total: usize, active: usize, speed: u64) {
+    let main = format!("{total} unduhan");
+    let spd = if speed > 0 { format!("\u{2193} {}", fmt_speed(speed)) } else { String::new() };
+    let act = format!("{active} aktif");
+    // Untuk fallback owner-draw tema gelap (saat ini nonaktif).
+    *STATUS_TEXT.lock().unwrap() = format!("{main} \u{2022} {act}");
+    let Some(sb) = state::load_hwnd(&state::STATUS_HWND) else { return };
+    let dark = DARK.load(Ordering::SeqCst);
+    unsafe {
+        if dark {
+            let c = rgb(DARK_SURFACE.0, DARK_SURFACE.1, DARK_SURFACE.2);
+            SendMessageW(sb, SB_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(c.0 as isize)));
+            let edges = [-1i32];
+            SendMessageW(sb, SB_SETPARTS, Some(WPARAM(1)), Some(LPARAM(edges.as_ptr() as isize)));
+            SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0x1000)), Some(LPARAM(0)));
+        } else {
+            SendMessageW(sb, SB_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(CLR_DEFAULT as isize)));
+            let mut rc = RECT::default();
+            let _ = GetClientRect(sb, &mut rc);
+            let w = rc.right;
+            let edges = [(w - 240).max(140), (w - 110).max(200), -1i32];
+            SendMessageW(sb, SB_SETPARTS, Some(WPARAM(3)), Some(LPARAM(edges.as_ptr() as isize)));
+            set_status_part(sb, 0, &format!("  {main}"));
+            set_status_part(sb, 1, &spd);
+            set_status_part(sb, 2, &format!("  {act}"));
+        }
+        let _ = InvalidateRect(Some(sb), None, true);
+    }
+}
+
+unsafe fn set_status_part(sb: HWND, i: usize, text: &str) {
+    let h = HSTRING::from(text);
+    SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(i)), Some(LPARAM(h.as_ptr() as isize)));
+}
+
 fn set_status_bar(text: &str) {
     *STATUS_TEXT.lock().unwrap() = text.to_string();
     let Some(sb) = state::load_hwnd(&state::STATUS_HWND) else { return };
@@ -2207,6 +2442,29 @@ fn add_tray_icon(hwnd: HWND) {
     let nid = tray_data(hwnd);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+}
+
+/// Notifikasi balon Windows lewat ikon tray (toast non-modal, mis. saat selesai).
+fn notify_balloon(hwnd: HWND, title: &str, body: &str) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    let t: Vec<u16> = title.encode_utf16().collect();
+    for (i, c) in t.iter().enumerate().take(nid.szInfoTitle.len() - 1) {
+        nid.szInfoTitle[i] = *c;
+    }
+    let b: Vec<u16> = body.encode_utf16().collect();
+    for (i, c) in b.iter().enumerate().take(nid.szInfo.len() - 1) {
+        nid.szInfo[i] = *c;
+    }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 

@@ -630,6 +630,8 @@ const IDC_DONTSHOW: usize = 5;
 
 /// Dialog modal "Download complete" (§9.14): Open / Open with… / Open folder /
 /// Close + "Don't show this dialog again". Close hanya menutup (tak membuka file).
+/// Disimpan untuk opsi masa depan; kini notifikasi selesai pakai balon tray.
+#[allow(dead_code)]
 pub fn show_complete(parent: HWND, row: &Row) {
     unsafe {
         let instance: HINSTANCE = match GetModuleHandleW(None) {

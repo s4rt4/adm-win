@@ -734,6 +734,33 @@ fn pwstr_to_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// Dialog pilih folder (klasik SHBrowseForFolder; tak butuh OLE init).
+pub fn pick_folder(parent: HWND, title: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW, BIF_RETURNONLYFSDIRS};
+    unsafe {
+        let th = HSTRING::from(title);
+        let bi = BROWSEINFOW {
+            hwndOwner: parent,
+            lpszTitle: PCWSTR(th.as_ptr()),
+            ulFlags: BIF_RETURNONLYFSDIRS,
+            ..Default::default()
+        };
+        let pidl = SHBrowseForFolderW(&bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let ok = SHGetPathFromIDListW(pidl, &mut buf).as_bool();
+        CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+        if ok {
+            Some(PathBuf::from(pwstr_to_string(&buf)))
+        } else {
+            None
+        }
+    }
+}
+
 // ============================ Site grabber ============================
 
 const G_FETCH: usize = 10;
