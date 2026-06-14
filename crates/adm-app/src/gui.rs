@@ -70,13 +70,10 @@ fn filter_match(filter: u8, r: &store::Row) -> bool {
         F_UNFINISHED => r.status != Status::Complete,
         F_FINISHED => r.status == Status::Complete,
         F_QUEUES => r.status == Status::Queued,
-        F_GRABBER => GRABBER_IDS.lock().unwrap().contains(&r.id),
+        F_GRABBER => r.from_grabber,
         _ => true,
     }
 }
-
-/// id unduhan yang ditambahkan via Site Grabber (untuk node "Grabber projects").
-static GRABBER_IDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 const TRAY_UID: u32 = 1;
 const SIDEBAR_W: i32 = 190;
@@ -344,7 +341,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
-                store::save(); // simpan progres terakhir sebelum keluar
+                store::save_now(); // flush sinkron progres terakhir sebelum keluar
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -939,7 +936,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if let (Some(id), Some(e)) = (selected_id(), ENGINE.get()) {
                 if let Some(r) = store::get(id) {
                     let fname = r.filename();
-                    e.resume(id, r.url, fname, r.insecure);
+                    e.resume(id, r.url, fname, r.insecure, r.referrer, r.user_agent, r.cookies);
                     refresh_ui(hwnd);
                     crate::progress::open(hwnd, id); // dialog status muncul lagi
                 }
@@ -1148,12 +1145,17 @@ unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
             params.cookies = params.cookies.or_else(|| inc.cookies.clone());
             params.filename = params.filename.or_else(|| inc.filename.clone());
         }
+        // Simpan header titipan di Row agar resume (termasuk setelah restart)
+        // tetap membawa cookie/referrer/UA.
+        let (rf, ua, ck) = (params.referrer.clone(), params.user_agent.clone(), params.cookies.clone());
         if start_now {
             let id = engine.add(params);
+            store::set_request_meta(id, rf, ua, ck);
             refresh_ui(hwnd);
             crate::progress::open(hwnd, id); // dialog "Download status"
         } else {
-            engine.enqueue(params);
+            let id = engine.enqueue(params);
+            store::set_request_meta(id, rf, ua, ck);
             refresh_ui(hwnd);
         }
     }
@@ -1178,7 +1180,7 @@ unsafe fn add_urls(hwnd: HWND, urls: &[String], from_grabber: bool) {
         for u in urls {
             let id = e.enqueue(DownloadAddParams { url: u.clone(), ..Default::default() });
             if from_grabber {
-                GRABBER_IDS.lock().unwrap().push(id);
+                store::set_from_grabber(id);
             }
         }
     }
@@ -1311,7 +1313,7 @@ unsafe fn do_refresh_link(hwnd: HWND, id: u64) {
         if new_url.is_empty() || new_url == row.url {
             return;
         }
-        e.resume(id, new_url, row.filename(), row.insecure);
+        e.resume(id, new_url, row.filename(), row.insecure, row.referrer, row.user_agent, row.cookies);
         refresh_ui(hwnd);
         crate::progress::open(hwnd, id);
     }
@@ -1336,7 +1338,7 @@ unsafe fn do_download_insecure(hwnd: HWND, id: u64) {
     store::set_insecure(id, true);
     store::save();
     let fname = row.filename();
-    e.resume(id, row.url, fname, true);
+    e.resume(id, row.url, fname, true, row.referrer, row.user_agent, row.cookies);
     refresh_ui(hwnd);
     crate::progress::open(hwnd, id);
 }
@@ -1388,7 +1390,7 @@ unsafe fn do_redownload(hwnd: HWND) {
     sidecar.push(".adm");
     let _ = std::fs::remove_file(sidecar);
     let fname = row.filename();
-    e.resume(id, row.url, fname, row.insecure);
+    e.resume(id, row.url, fname, row.insecure, row.referrer, row.user_agent, row.cookies);
     refresh_ui(hwnd);
     crate::progress::open(hwnd, id);
 }

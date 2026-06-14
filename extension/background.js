@@ -121,10 +121,23 @@ function containerOf(url, ct) {
   return (extFromCt(ct) || "MEDIA").toUpperCase();
 }
 
+// Mirror daftar media per-tab ke storage.session agar bertahan bila service
+// worker MV3 di-evict (Map in-memory hilang saat SW mati).
+function persistTab(tabId) {
+  const m = mediaByTab.get(tabId);
+  const items = m ? [...m.values()] : [];
+  chrome.storage.session.set({ ["m" + tabId]: items }).catch(() => {});
+}
+
 function pushToTab(tabId) {
   const m = mediaByTab.get(tabId);
   const items = m ? [...m.values()] : [];
   chrome.tabs.sendMessage(tabId, { type: "adm-media", items }, () => void chrome.runtime.lastError);
+}
+
+function clearTab(tabId) {
+  mediaByTab.delete(tabId);
+  chrome.storage.session.remove("m" + tabId).catch(() => {});
 }
 
 function addMedia(tabId, item) {
@@ -135,6 +148,7 @@ function addMedia(tabId, item) {
   }
   if (m.has(item.url)) return;
   m.set(item.url, item);
+  persistTab(tabId);
   pushToTab(tabId);
 }
 
@@ -165,15 +179,30 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 // Bersihkan daftar saat tab navigasi/ditutup.
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.status === "loading") mediaByTab.delete(tabId);
+  if (info.status === "loading") clearTab(tabId);
 });
-chrome.tabs.onRemoved.addListener((tabId) => mediaByTab.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => clearTab(tabId));
 
 // Pesan dari content script: minta daftar / minta unduh item terpilih.
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !sender.tab) return;
   if (msg.type === "adm-get-media") {
-    pushToTab(sender.tab.id);
+    const tabId = sender.tab.id;
+    if (mediaByTab.has(tabId)) {
+      pushToTab(tabId);
+    } else {
+      // SW mungkin baru bangun → pulihkan dari storage.session.
+      chrome.storage.session
+        .get("m" + tabId)
+        .then((res) => {
+          const items = res["m" + tabId] || [];
+          if (items.length) {
+            mediaByTab.set(tabId, new Map(items.map((it) => [it.url, it])));
+          }
+          chrome.tabs.sendMessage(tabId, { type: "adm-media", items }, () => void chrome.runtime.lastError);
+        })
+        .catch(() => {});
+    }
   } else if (msg.type === "adm-download" && msg.url) {
     sendToAdm(msg.url, msg.filename, sender.tab.url);
   }

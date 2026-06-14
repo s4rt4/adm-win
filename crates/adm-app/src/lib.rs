@@ -96,11 +96,14 @@ pub fn run() {
                     url: r.url.clone(),
                     filename: Some(r.filename()),
                     insecure: r.insecure,
-                    ..Default::default()
+                    referrer: r.referrer.clone(),
+                    user_agent: r.user_agent.clone(),
+                    cookies: r.cookies.clone(),
                 },
             );
         }
     });
+    store::start_saver(); // thread penyimpan daftar (debounce, non-blocking)
     gui::set_engine(engine.clone());
     scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)
 

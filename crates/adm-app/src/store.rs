@@ -54,6 +54,17 @@ pub struct Row {
     /// Pesan error terakhir (transien) — untuk membedakan jenis kegagalan.
     #[serde(skip)]
     pub last_error: Option<String>,
+    /// Ditambahkan via Site Grabber (untuk node sidebar "Grabber projects").
+    #[serde(default)]
+    pub from_grabber: bool,
+    /// Header titipan browser untuk resume unduhan ber-autentikasi (mis. Gmail).
+    /// Cookie disimpan apa adanya — sensitif; berada di %APPDATA% milik user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referrer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<String>,
     pub category: Category,
 }
 
@@ -136,6 +147,10 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             failed_announced: false,
             insecure: false,
             last_error: None,
+            from_grabber: false,
+            referrer: None,
+            user_agent: None,
+            cookies: None,
             category,
         });
     }
@@ -166,6 +181,10 @@ pub fn on_queued(id: u64, url: String, output: PathBuf) {
         failed_announced: false,
         insecure: false,
         last_error: None,
+        from_grabber: false,
+        referrer: None,
+        user_agent: None,
+        cookies: None,
         category,
     });
 }
@@ -238,6 +257,28 @@ pub fn set_insecure(id: u64, val: bool) {
     }
 }
 
+/// Tandai baris berasal dari Site Grabber.
+pub fn set_from_grabber(id: u64) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.from_grabber = true;
+    }
+}
+
+/// Simpan header titipan browser (referrer/UA/cookie) agar resume ber-auth
+/// tetap jalan, termasuk setelah aplikasi di-restart (dipersist di Row).
+pub fn set_request_meta(
+    id: u64,
+    referrer: Option<String>,
+    user_agent: Option<String>,
+    cookies: Option<String>,
+) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.referrer = referrer;
+        r.user_agent = user_agent;
+        r.cookies = cookies;
+    }
+}
+
 /// Hapus baris; kembalikan baris yang dihapus (untuk hapus file bila perlu).
 pub fn remove(id: u64) -> Option<Row> {
     let mut rows = ROWS.lock().unwrap();
@@ -288,12 +329,39 @@ fn store_file() -> PathBuf {
     PathBuf::from(base).join("ADM").join("downloads.json")
 }
 
-/// Serialisasi penulisan berkas (save bisa dipicu dari thread engine & UI).
+/// Serialisasi penulisan berkas (save bisa dipicu dari thread saver & UI).
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+/// Penanda ada perubahan yang belum ditulis (di-debounce oleh thread saver).
+static DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Simpan daftar unduhan ke `%APPDATA%\ADM\downloads.json` (atomik).
-/// Dipanggil pada perubahan struktural (tambah/hapus/ubah status) & saat keluar.
+/// Tandai daftar berubah. NON-BLOCKING — penulisan ke disk dilakukan thread
+/// saver (lihat `start_saver`), jadi UI/engine tak terblokir I/O tiap event.
 pub fn save() {
+    DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Tulis sekarang juga (sinkron) — dipakai saat keluar untuk flush terakhir.
+pub fn save_now() {
+    DIRTY.store(false, std::sync::atomic::Ordering::SeqCst);
+    write_now();
+}
+
+/// Thread latar yang menulis ke disk paling sering ~tiap 800ms bila ada
+/// perubahan (coalesce). Dipanggil sekali saat startup.
+pub fn start_saver() {
+    std::thread::Builder::new()
+        .name("adm-store-saver".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            if DIRTY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                write_now();
+            }
+        })
+        .ok();
+}
+
+/// Tulis daftar ke `%APPDATA%\ADM\downloads.json` secara atomik (tmp + rename).
+fn write_now() {
     let snapshot: Vec<Row> = ROWS.lock().unwrap().clone();
     let _guard = SAVE_LOCK.lock().unwrap();
     let file = store_file();

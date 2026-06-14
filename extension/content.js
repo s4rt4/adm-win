@@ -121,6 +121,15 @@
     }
   });
 
+  function requestMedia() {
+    chrome.runtime.sendMessage({ type: "adm-get-media" }, () => void chrome.runtime.lastError);
+  }
+
   // Minta daftar terkini (mis. bila service worker sudah mendeteksi sebelumnya).
-  chrome.runtime.sendMessage({ type: "adm-get-media" }, () => void chrome.runtime.lastError);
+  requestMedia();
+  // Saat tab kembali terlihat, minta lagi — service worker bisa sempat di-evict
+  // (panel jadi kosong) lalu dipulihkan dari storage.session.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") requestMedia();
+  });
 })();

@@ -70,9 +70,6 @@ pub struct EngineHandle {
     queue: Arc<Mutex<QueueState>>,
     /// Limiter global (dibagi semua unduhan); live-adjustable.
     global_limiter: Arc<Limiter>,
-    /// Metadata titipan browser per-id (referrer/UA/cookie) untuk resume; sesi
-    /// saja (tak dipersist — cookie sensitif & URL/ sesi cepat kedaluwarsa).
-    meta: Arc<Mutex<HashMap<u64, DownloadAddParams>>>,
 }
 
 impl EngineHandle {
@@ -90,7 +87,6 @@ impl EngineHandle {
                 running_ids: HashSet::new(),
             })),
             global_limiter: Arc::new(Limiter::unlimited()),
-            meta: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -154,16 +150,20 @@ impl EngineHandle {
     }
 
     /// Lanjutkan unduhan yang sudah ada (segera). `insecure` mengabaikan
-    /// verifikasi sertifikat TLS. Header titipan (referrer/UA/cookie) diambil
-    /// dari metadata sesi bila masih ada.
-    pub fn resume(&self, id: u64, url: String, filename: String, insecure: bool) {
-        let (referrer, user_agent, cookies) = self
-            .meta
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|m| (m.referrer.clone(), m.user_agent.clone(), m.cookies.clone()))
-            .unwrap_or_default();
+    /// verifikasi sertifikat TLS; header titipan (referrer/UA/cookie) diberikan
+    /// pemanggil dari baris store (dipersist), agar resume ber-auth tetap jalan
+    /// termasuk setelah restart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        &self,
+        id: u64,
+        url: String,
+        filename: String,
+        insecure: bool,
+        referrer: Option<String>,
+        user_agent: Option<String>,
+        cookies: Option<String>,
+    ) {
         self.start(
             id,
             DownloadAddParams {
@@ -247,8 +247,6 @@ impl EngineHandle {
     }
 
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
-        // Simpan metadata titipan (referrer/UA/cookie) agar resume bisa pakai lagi.
-        self.meta.lock().unwrap().insert(id, params.clone());
         let cancel = CancelToken::new();
         let per_limiter = Arc::new(Limiter::unlimited());
         self.active

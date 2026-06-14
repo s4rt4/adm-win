@@ -130,6 +130,24 @@ fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
     Ok(b.build()?)
 }
 
+/// Verifikasi `len` byte pertama di `output` cocok dengan byte awal dari `url`.
+/// `Some(true)` cocok, `Some(false)` JELAS berbeda, `None` tak bisa diperiksa
+/// (jaringan gagal) — pemanggil hanya membuang parsial bila `Some(false)`.
+async fn verify_prefix(client: &Client, url: &str, output: &std::path::Path, len: u64) -> Option<bool> {
+    use std::io::Read;
+    let range = format!("bytes=0-{}", len - 1);
+    let resp = client.get(url).header(RANGE, range).send().await.ok()?.error_for_status().ok()?;
+    let body = resp.bytes().await.ok()?;
+    let n = (len as usize).min(body.len());
+    if n == 0 {
+        return None;
+    }
+    let mut disk = vec![0u8; n];
+    let mut f = std::fs::File::open(output).ok()?;
+    f.read_exact(&mut disk).ok()?;
+    Some(disk.as_slice() == &body[..n])
+}
+
 /// Probe ringan satu URL (client default tanpa header titipan).
 pub async fn probe_url(url: &str) -> Result<probe::Probe> {
     probe_url_with(url, &ReqHeaders::default(), false).await
@@ -176,20 +194,42 @@ pub async fn download(
     let conns = req.connections.clamp(1, 64);
 
     // Resume bila sidecar cocok; selain itu rencana segar.
-    let segments: Vec<Arc<SegState>> = match sidecar::load(&sidecar_path) {
-        Some(sc) if sc.is_compatible(&req.url, &pr) => sc
+    let loaded = sidecar::load(&sidecar_path);
+    let reuse = loaded.as_ref().is_some_and(|sc| sc.is_compatible(&req.url, &pr));
+    let url_changed = loaded.as_ref().is_some_and(|sc| sc.url != req.url);
+    let mut segments: Vec<Arc<SegState>> = if reuse {
+        loaded
+            .as_ref()
+            .unwrap()
             .segments
-            .into_iter()
+            .iter()
             .map(|r| {
                 Arc::new(SegState {
                     start: r.start,
                     end: r.end,
-                    downloaded: AtomicU64::new(r.downloaded.min(r.end - r.start + 1)),
+                    // saturating: sidecar bisa rusak (end<start) — jangan panik.
+                    downloaded: AtomicU64::new(r.downloaded.min(r.end.saturating_sub(r.start) + 1)),
                 })
             })
-            .collect(),
-        _ => plan_segments(total, conns),
+            .collect()
+    } else {
+        plan_segments(total, conns)
     };
+
+    // Refresh Link (URL berubah, cocok-by-size): verifikasi byte awal di disk
+    // cocok dengan sumber baru. Bila JELAS berbeda → buang parsial & unduh ulang
+    // dari awal (cegah korup saat link baru menunjuk file beda berukuran sama).
+    if reuse && url_changed {
+        let prefix = segments
+            .iter()
+            .find(|s| s.start == 0)
+            .map(|s| s.downloaded.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let check = prefix.min(64 * 1024);
+        if check > 0 && verify_prefix(&client, &req.url, &req.output, check).await == Some(false) {
+            segments = plan_segments(total, conns);
+        }
+    }
 
     platform::preallocate(&req.output, total)?;
 
