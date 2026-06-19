@@ -548,7 +548,8 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
         lv,
         LVM_SETEXTENDEDLISTVIEWSTYLE,
         Some(WPARAM(0)),
-        Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize)),
+        // DOUBLEBUFFER: cegah flicker putih saat sel di-update tiap progress tick.
+        Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER) as isize)),
     );
     add_list_columns(lv);
     // Ikon tipe-file sistem (DPI-aware) di kolom File Name.

@@ -91,7 +91,9 @@ fn parse_content_disposition(v: &str) -> Option<String> {
     None
 }
 
-fn percent_decode(s: &str) -> String {
+/// Dekode percent-encoding (`%20`→spasi, `%5B`→`[`, dst.) jadi UTF-8.
+/// Dipakai juga lapisan app untuk basename URL agar nama berkas tak ber-`%xx`.
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

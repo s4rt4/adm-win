@@ -359,7 +359,7 @@ fn url_basename(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or("");
     path.rsplit('/')
         .next()
-        .map(sanitize)
+        .map(|s| sanitize(&adm_core::percent_decode(s)))
         .filter(|s| !s.is_empty() && s.contains('.'))
 }
 
@@ -372,7 +372,7 @@ fn pick_filename(params: &DownloadAddParams, id: u64) -> String {
     let path = params.url.split(['?', '#']).next().unwrap_or("");
     if let Some(seg) = path.rsplit('/').next() {
         if !seg.is_empty() {
-            return sanitize(seg);
+            return sanitize(&adm_core::percent_decode(seg));
         }
     }
     format!("download-{id}.bin")

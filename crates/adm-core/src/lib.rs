@@ -22,7 +22,7 @@ pub use download::{
 pub use error::{Error, Result};
 pub use grabber::{extract_links, grab_links};
 pub use limiter::Limiter;
-pub use probe::{probe, Probe};
+pub use probe::{percent_decode, probe, Probe};
 
 /// Versi crate, dipakai a.l. untuk balasan `daemon.ping`.
 pub fn version() -> &'static str {

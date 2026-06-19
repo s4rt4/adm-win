@@ -372,9 +372,10 @@ fn fmt_size(bytes: u64) -> String {
 
 fn guess_filename(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or("");
-    path.rsplit(['/', '\\'])
+    let seg = path
+        .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
-        .unwrap_or("download.bin")
-        .to_string()
+        .unwrap_or("download.bin");
+    adm_core::percent_decode(seg)
 }
