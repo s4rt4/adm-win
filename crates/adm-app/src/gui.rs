@@ -1707,6 +1707,17 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
     if ids.is_empty() {
         return;
     }
+    // Konfirmasi sebelum menghapus (apalagi bila berkas ikut dihapus dari disk).
+    let n = ids.len();
+    let prompt = if delete_file {
+        format!("Hapus {n} unduhan beserta berkasnya dari disk?")
+    } else {
+        format!("Hapus {n} unduhan dari daftar?")
+    };
+    let h = HSTRING::from(prompt);
+    if MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("Konfirmasi hapus"), MB_YESNO | MB_ICONWARNING) != IDYES {
+        return;
+    }
     let engine = ENGINE.get();
     // Hapus per-id (bukan per-index) agar pergeseran indeks tak mengganggu.
     for id in ids {
