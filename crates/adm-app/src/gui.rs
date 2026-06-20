@@ -1328,7 +1328,12 @@ unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
     // Browser (incoming Some) → "Download File Info" dengan nama file otomatis.
     // Manual (None) → dialog "Add new download" sederhana tanpa nama file.
     let result = if let Some(inc) = &incoming {
-        dialogs::download_info_dialog(hwnd, &inc.url, inc.filename.as_deref(), &dir)
+        let headers = adm_core::ReqHeaders {
+            referrer: inc.referrer.clone(),
+            user_agent: inc.user_agent.clone(),
+            cookies: inc.cookies.clone(),
+        };
+        dialogs::download_info_dialog(hwnd, &inc.url, inc.filename.as_deref(), &dir, headers)
     } else {
         dialogs::add_url_dialog(hwnd, "")
     };
@@ -1341,20 +1346,88 @@ unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
             params.cookies = params.cookies.or_else(|| inc.cookies.clone());
             params.filename = params.filename.or_else(|| inc.filename.clone());
         }
+        // Deteksi duplikat: bila nama target sudah dipakai unduhan lain (di
+        // daftar) atau berkasnya sudah ada di folder tujuan, tanyakan user.
+        // "Yes" → unduh ulang dgn nama disisipi " (1)", " (2)", … agar tak
+        // menimpa berkas/sidecar yang sedang/jadi diunduh. "No" → batal.
+        if let Some(fname) = params.filename.clone().filter(|s| !s.is_empty()) {
+            if output_in_use(&planned_output(&dir, &fname)) {
+                let msg = HSTRING::from(format!(
+                    "Berkas \"{fname}\" sudah ada di daftar unduhan atau folder tujuan.\n\n\
+                     Unduh lagi dengan nama berbeda?",
+                ));
+                let r = MessageBoxW(Some(hwnd), PCWSTR(msg.as_ptr()), w!("Berkas sudah ada"), MB_YESNO | MB_ICONQUESTION);
+                if r != IDYES {
+                    return;
+                }
+                params.filename = Some(dedupe_name(&dir, &fname));
+            }
+        }
         // Simpan header titipan di Row agar resume (termasuk setelah restart)
         // tetap membawa cookie/referrer/UA.
         let (rf, ua, ck) = (params.referrer.clone(), params.user_agent.clone(), params.cookies.clone());
         if start_now {
             let id = engine.add(params);
             store::set_request_meta(id, rf, ua, ck);
-            refresh_ui(hwnd);
+            // Buka dialog status SEBELUM refresh_ui: unduhan bisa langsung
+            // Complete (mis. resume berkas yg sudah penuh) sebelum baris ini.
+            // refresh_ui memanggil take_newly_completed→close_for; bila dialog
+            // belum terdaftar di OPEN_DIALOGS, penutupan terlewat (complete
+            // sudah "announced") → dialog macet di "Complete". Daftarkan dulu.
             crate::progress::open(hwnd, id); // dialog "Download status"
+            refresh_ui(hwnd);
         } else {
             let id = engine.enqueue(params);
             store::set_request_meta(id, rf, ua, ck);
             refresh_ui(hwnd);
         }
     }
+}
+
+/// Path output yang akan dipakai engine untuk `filename` (mirror
+/// `engine::output_for`): download_dir [+ subfolder kategori] / nama.
+fn planned_output(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let mut d = dir.to_path_buf();
+    if let Some(folder) = crate::category::Category::from_filename(filename).folder() {
+        d.push(folder);
+    }
+    d.join(filename)
+}
+
+/// True bila `path` sudah dipakai unduhan lain di daftar, atau berkasnya sudah
+/// ada di disk (case-insensitive sesuai Windows).
+fn output_in_use(path: &std::path::Path) -> bool {
+    let lc = path.to_string_lossy().to_lowercase();
+    let in_list = store::with_rows(|rows| {
+        rows.iter().any(|r| r.output.to_string_lossy().to_lowercase() == lc)
+    });
+    in_list || path.exists()
+}
+
+/// Pisah `nama.ext` → (`nama`, `ext`); tanpa ekstensi → (`nama`, "").
+/// Titik di indeks 0 (dotfile) dianggap tak punya ekstensi.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
+    }
+}
+
+/// Nama unik dgn menyisipkan " (n)" sebelum ekstensi sampai tak bentrok
+/// (daftar + disk). Mengembalikan basename saja (folder ditentukan engine).
+fn dedupe_name(dir: &std::path::Path, filename: &str) -> String {
+    let (stem, ext) = split_ext(filename);
+    for n in 1.. {
+        let cand = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        if !output_in_use(&planned_output(dir, &cand)) {
+            return cand;
+        }
+    }
+    unreachable!()
 }
 
 /// Dialog batch (Tasks → Add batch / from clipboard). `initial` prefill.
