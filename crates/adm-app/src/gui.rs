@@ -1123,24 +1123,62 @@ fn selected_id() -> Option<u64> {
     unsafe { item_id(lv, idx) }
 }
 
+/// Semua id baris yang sedang terseleksi (multi-select), urut tampilan.
+fn selected_ids() -> Vec<u64> {
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let mut idx: i32 = -1;
+    unsafe {
+        loop {
+            let r = SendMessageW(
+                lv,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(idx as usize)), // -1 = dari awal; lalu dari idx terakhir
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            );
+            if r.0 < 0 {
+                break;
+            }
+            idx = r.0 as i32;
+            if let Some(id) = item_id(lv, idx) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
 // ============================ Commands ============================
 
 unsafe fn handle_command(hwnd: HWND, id: usize) {
     match id {
         ID_ADD => do_add(hwnd),
         ID_RESUME | ID_DOWNLOAD_NOW => {
-            if let (Some(id), Some(e)) = (selected_id(), ENGINE.get()) {
-                if let Some(r) = store::get(id) {
-                    let fname = r.filename();
-                    e.resume(id, r.url, fname, r.insecure, r.referrer, r.user_agent, r.cookies);
+            if let Some(e) = ENGINE.get() {
+                let ids = selected_ids();
+                for id in &ids {
+                    if let Some(r) = store::get(*id) {
+                        let fname = r.filename();
+                        e.resume(*id, r.url, fname, r.insecure, r.referrer, r.user_agent, r.cookies);
+                    }
+                }
+                if !ids.is_empty() {
                     refresh_ui(hwnd);
-                    crate::progress::open(hwnd, id); // dialog status muncul lagi
+                    // Buka dialog status hanya bila satu yang diseleksi — hindari
+                    // banyak dialog menumpuk saat resume massal.
+                    if ids.len() == 1 {
+                        crate::progress::open(hwnd, ids[0]);
+                    }
                 }
             }
         }
         ID_STOP => {
-            if let (Some(id), Some(e)) = (selected_id(), ENGINE.get()) {
-                e.cancel(id);
+            if let Some(e) = ENGINE.get() {
+                for id in selected_ids() {
+                    e.cancel(id);
+                }
             }
         }
         ID_PAUSE_ALL | ID_STOP_ALL => {
@@ -1665,16 +1703,23 @@ unsafe fn do_redownload(hwnd: HWND) {
 }
 
 unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
-    let Some(id) = selected_id() else { return };
-    if let Some(e) = ENGINE.get() {
-        e.cancel(id);
+    let ids = selected_ids();
+    if ids.is_empty() {
+        return;
     }
-    if let Some(row) = store::remove(id) {
-        if delete_file {
-            let _ = std::fs::remove_file(&row.output);
-            let mut sc = row.output.clone().into_os_string();
-            sc.push(".adm");
-            let _ = std::fs::remove_file(sc);
+    let engine = ENGINE.get();
+    // Hapus per-id (bukan per-index) agar pergeseran indeks tak mengganggu.
+    for id in ids {
+        if let Some(e) = engine {
+            e.cancel(id);
+        }
+        if let Some(row) = store::remove(id) {
+            if delete_file {
+                let _ = std::fs::remove_file(&row.output);
+                let mut sc = row.output.clone().into_os_string();
+                sc.push(".adm");
+                let _ = std::fs::remove_file(sc);
+            }
         }
     }
     store::save();
