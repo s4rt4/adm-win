@@ -347,7 +347,7 @@ impl EngineHandle {
     }
 }
 
-fn looks_generic(name: &str) -> bool {
+pub(crate) fn looks_generic(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == "download.bin"
         || n == "download"
@@ -378,7 +378,7 @@ fn pick_filename(params: &DownloadAddParams, id: u64) -> String {
     format!("download-{id}.bin")
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
         .collect()
