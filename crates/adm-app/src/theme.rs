@@ -9,7 +9,6 @@ use windows::Win32::System::Registry::{
 };
 
 /// Apakah Windows sedang memakai tema gelap (AppsUseLightTheme == 0).
-#[allow(dead_code)] // dipakai lagi saat dark mode dirombak
 pub fn system_is_dark() -> bool {
     unsafe {
         let mut hkey = HKEY::default();
@@ -60,8 +59,12 @@ pub fn set_dark_menus(dark: bool) {
     }
 }
 
-/// Tema efektif. **Dark mode dinonaktifkan sementara** (rendering bermasalah —
-/// akan dirombak nanti); selalu Light agar UI stabil.
-pub fn effective_dark(_theme_setting: u8) -> bool {
-    false
+/// Tema efektif sesuai setting: Dark/Light eksplisit, atau ikut sistem.
+/// (Nilai cocok dengan `settings::THEME_*`: 0=System, 1=Light, 2=Dark.)
+pub fn effective_dark(theme_setting: u8) -> bool {
+    match theme_setting {
+        crate::settings::THEME_DARK => true,
+        crate::settings::THEME_LIGHT => false,
+        _ => system_is_dark(),
+    }
 }

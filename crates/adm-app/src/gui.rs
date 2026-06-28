@@ -45,10 +45,11 @@ const ABOUT_CLASS: PCWSTR = w!("AdmAboutDialog");
 const IDC_ABOUT_OK: usize = 1;
 const IDC_ABOUT_LINK: usize = 2;
 
-// Palet tema gelap dari logo (plan §12).
-const DARK_BG: (u8, u8, u8) = (26, 38, 32); // #1A2620
-const DARK_SURFACE: (u8, u8, u8) = (36, 52, 48); // #243430
-const DARK_TEXT: (u8, u8, u8) = (230, 236, 232); // #E6ECE8
+// Palet tema gelap — One Dark Pro (lembut, biru-abu netral).
+const DARK_BG: (u8, u8, u8) = (40, 44, 52); // #282C34 editor (konten: list/tree)
+const DARK_SURFACE: (u8, u8, u8) = (33, 37, 43); // #21252B chrome (toolbar/status, lebih gelap)
+const DARK_TEXT: (u8, u8, u8) = (171, 178, 191); // #ABB2BF teks utama
+const DARK_ACCENT: (u8, u8, u8) = (152, 195, 121); // #98C379 hijau (bar progres)
 
 // Tombol menu-strip (pengganti menu bar agar bisa gelap).
 const ID_MENU_BASE: usize = 0x1A0; // ID_MENU_BASE+0..5
@@ -341,6 +342,19 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
 // ============================ WndProc ============================
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Tameng anti-crash: panik di jalur paint/notify (custom-draw, owner-draw)
+    // TIDAK boleh menyeberang batas FFI — itu yang dulu membuat dark mode
+    // abort senyap → window zombie. catch_unwind menahannya di sisi Rust;
+    // bila panik, lewati pesan ini dengan DefWindowProc (app tetap hidup).
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wndproc_inner(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(r) => r,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_CREATE => {
@@ -444,7 +458,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = DeleteObject(br.into());
                     SetBkMode(dis.hDC, TRANSPARENT);
                     SetTextColor(dis.hDC, rgb(DARK_TEXT.0, DARK_TEXT.1, DARK_TEXT.2));
-                    let text = STATUS_TEXT.lock().unwrap().clone();
+                    // Kebal-poison: jangan biarkan mutex ter-poison membuat
+                    // setiap repaint status bar ikut panik.
+                    let text = STATUS_TEXT
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|e| e.into_inner().clone());
                     let mut wide: Vec<u16> = text.encode_utf16().collect();
                     let mut rc = dis.rcItem;
                     rc.left += 6;
@@ -1075,17 +1094,26 @@ unsafe fn list_customdraw(lparam: LPARAM) -> LRESULT {
     if bar.right <= bar.left || bar.bottom <= bar.top {
         return dodefault;
     }
+    let dark = DARK.load(Ordering::SeqCst);
     let hdc = p.nmcd.hdc;
-    let track = CreateSolidBrush(rgb(228, 228, 228));
+    let track_c = if dark { rgb(52, 58, 68) } else { rgb(228, 228, 228) };
+    let track = CreateSolidBrush(track_c);
     FillRect(hdc, &bar, track);
     let _ = DeleteObject(track.into());
     let w = bar.right - bar.left;
     let fill_rc = RECT { right: bar.left + w * pct / 100, ..bar };
-    let green = CreateSolidBrush(rgb(59, 160, 90));
+    let fill_c = if dark {
+        rgb(DARK_ACCENT.0, DARK_ACCENT.1, DARK_ACCENT.2)
+    } else {
+        rgb(59, 160, 90)
+    };
+    let green = CreateSolidBrush(fill_c);
     FillRect(hdc, &fill_rc, green);
     let _ = DeleteObject(green.into());
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, rgb(20, 20, 20));
+    // Teks persen: gelap di atas porsi terisi terang; di gelap pakai teks terang
+    // bila masih di area track.
+    SetTextColor(hdc, if dark { rgb(220, 224, 232) } else { rgb(20, 20, 20) });
     let mut wide: Vec<u16> = format!("{pct}%").encode_utf16().collect();
     DrawTextW(hdc, &mut wide, &mut bar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     LRESULT(CDRF_SKIPDEFAULT as isize)

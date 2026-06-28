@@ -18,5 +18,7 @@ authors = ["s4rt4 <surat.sarta@gmail.com>"]
 opt-level = "z"
 lto = true
 codegen-units = 1
+# panic = "unwind" (default): wndproc dibungkus catch_unwind agar panik di jalur
+# paint/notify tak menyeberang FFI jadi abort senyap (bug dark-mode lama). "abort"
+# akan membuat catch_unwind sia-sia, jadi sengaja TIDAK dipakai.
 strip = true
-panic = "abort"
