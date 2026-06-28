@@ -5,17 +5,23 @@
 //! agar konsisten dengan window utama. Aman saat tema terang (semua jadi no-op).
 
 use std::sync::Mutex;
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Palet One Dark Pro (selaras `gui.rs`).
 const BG: (u8, u8, u8) = (40, 44, 52); // #282C34 latar dialog
 const EDIT_BG: (u8, u8, u8) = (30, 33, 39); // #1E2127 field input (sedikit lebih gelap)
 const TEXT: (u8, u8, u8) = (171, 178, 191); // #ABB2BF teks
+const HEADER_BG: (u8, u8, u8) = (45, 50, 59); // #2D323B header tabel (sedikit > body)
+const HEADER_SEP: (u8, u8, u8) = (60, 66, 76); // pemisah kolom header (halus)
+
+// ID subclass header (arbitrer, unik per kelas subclass).
+const HEADER_SUBCLASS_ID: usize = 0x00AD_0001;
 
 // Brush di-cache (hidup selama proses; sengaja tak dilepas — dipakai berulang).
 static BG_BRUSH: Mutex<isize> = Mutex::new(0);
@@ -68,6 +74,7 @@ unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
         SendMessageW(child, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
         SendMessageW(child, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
         SendMessageW(child, LVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt)));
+        install_header(child);
     } else if name.eq_ignore_ascii_case("SysTreeView32") {
         SendMessageW(child, TVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
         SendMessageW(child, TVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt)));
@@ -108,4 +115,92 @@ pub unsafe fn erasebkgnd(hwnd: HWND, wparam: WPARAM) -> Option<LRESULT> {
     let _ = GetClientRect(hwnd, &mut rc);
     FillRect(hdc, &rc, cached_brush(&BG_BRUSH, BG));
     Some(LRESULT(1))
+}
+
+/// Pasang subclass pada ListView agar header (SysHeader32) bisa di-custom-draw
+/// gelap — notifikasi NM_CUSTOMDRAW header dikirim ke ListView, bukan ke window
+/// utama. Aman dipanggil berulang (uIdSubclass sama = perbarui, tak menumpuk).
+/// Proc menggating sendiri via `is_dark()`, jadi tetap benar saat tema terang.
+pub unsafe fn install_header(lv: HWND) {
+    let _ = SetWindowSubclass(lv, Some(lv_subclass), HEADER_SUBCLASS_ID, 0);
+    // Paksa header repaint agar warna langsung ikut.
+    let hdr = SendMessageW(lv, LVM_GETHEADER, Some(WPARAM(0)), Some(LPARAM(0)));
+    if hdr.0 != 0 {
+        let _ = InvalidateRect(Some(HWND(hdr.0 as *mut core::ffi::c_void)), None, true);
+    }
+}
+
+unsafe extern "system" fn lv_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    if msg == WM_NOTIFY && is_dark() && lparam.0 != 0 {
+        let nm = &*(lparam.0 as *const NMHDR);
+        if nm.code == NM_CUSTOMDRAW {
+            let mut cls = [0u16; 32];
+            let n = GetClassNameW(nm.hwndFrom, &mut cls);
+            if String::from_utf16_lossy(&cls[..n as usize]).eq_ignore_ascii_case("SysHeader32") {
+                if let Some(r) = header_customdraw(lparam) {
+                    return r;
+                }
+            }
+        }
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// Custom-draw satu item header: latar gelap + teks terang + pemisah halus.
+unsafe fn header_customdraw(lparam: LPARAM) -> Option<LRESULT> {
+    let cd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
+    let stage = cd.dwDrawStage;
+    if stage == CDDS_PREPAINT {
+        return Some(LRESULT(CDRF_NOTIFYITEMDRAW as isize));
+    }
+    if stage != CDDS_ITEMPREPAINT {
+        return Some(LRESULT(CDRF_DODEFAULT as isize));
+    }
+    let hdc = cd.hdc;
+    let rc = cd.rc;
+    // Latar header.
+    let bg = CreateSolidBrush(rgb(HEADER_BG));
+    FillRect(hdc, &rc, bg);
+    let _ = DeleteObject(bg.into());
+    // Pemisah kolom tipis di tepi kanan.
+    let sep = CreateSolidBrush(rgb(HEADER_SEP));
+    let line = RECT { left: rc.right - 1, top: rc.top + 4, right: rc.right, bottom: rc.bottom - 4 };
+    FillRect(hdc, &line, sep);
+    let _ = DeleteObject(sep.into());
+    // Teks + perataan dari item header.
+    let mut buf = [0u16; 128];
+    let mut item = HDITEMW {
+        mask: HDI_TEXT | HDI_FORMAT,
+        pszText: PWSTR(buf.as_mut_ptr()),
+        cchTextMax: 128,
+        ..Default::default()
+    };
+    let idx = cd.dwItemSpec as usize;
+    SendMessageW(
+        cd.hdr.hwndFrom,
+        HDM_GETITEMW,
+        Some(WPARAM(idx)),
+        Some(LPARAM(&mut item as *mut _ as isize)),
+    );
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let mut wide: Vec<u16> = buf[..len].to_vec();
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, rgb(TEXT));
+    let mut tr = RECT { left: rc.left + 7, top: rc.top, right: rc.right - 6, bottom: rc.bottom };
+    let align = if item.fmt.0 & HDF_RIGHT.0 != 0 {
+        DT_RIGHT
+    } else if item.fmt.0 & HDF_CENTER.0 != 0 {
+        DT_CENTER
+    } else {
+        DT_LEFT
+    };
+    DrawTextW(hdc, &mut wide, &mut tr, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    Some(LRESULT(CDRF_SKIPDEFAULT as isize))
 }

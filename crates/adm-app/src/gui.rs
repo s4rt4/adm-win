@@ -568,7 +568,9 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
         LVM_SETEXTENDEDLISTVIEWSTYLE,
         Some(WPARAM(0)),
         // DOUBLEBUFFER: cegah flicker putih saat sel di-update tiap progress tick.
-        Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER) as isize)),
+        // Gridlines dilepas: garis row/kolom bawaan terlalu dominan (sulit dibaca,
+        // terutama di tema gelap) — list lebih bersih tanpanya.
+        Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize)),
     );
     add_list_columns(lv);
     // Ikon tipe-file sistem (DPI-aware) di kolom File Name.
@@ -718,6 +720,14 @@ unsafe fn build_menus() {
     append(view, ID_TOOLBAR, w!("Toolbar"));
     append(view, ID_TRAY_ICON, w!("ADM tray icon"));
     append(view, ID_CUSTOMIZE, w!("Customize URL List..."));
+    sep(view);
+    // Submenu Theme (radio: System/Light/Dark) — disimpan utk update_theme_checks.
+    let theme = CreatePopupMenu().unwrap();
+    append(theme, ID_THEME_SYSTEM, w!("Use system setting"));
+    append(theme, ID_THEME_LIGHT, w!("Light"));
+    append(theme, ID_THEME_DARK, w!("Dark"));
+    THEME_MENU.store(theme.0 as isize, Ordering::SeqCst);
+    let _ = AppendMenuW(view, MF_POPUP, theme.0 as usize, w!("Theme"));
 
     let about = CreatePopupMenu().unwrap();
     append(about, ID_ABOUT, w!("About ADM"));
@@ -2474,7 +2484,11 @@ unsafe fn toolbar_customdraw(lparam: LPARAM) -> LRESULT {
         LRESULT(CDRF_NOTIFYITEMDRAW as isize)
     } else if stage == CDDS_ITEMPREPAINT {
         cd.clrText = rgb(DARK_TEXT.0, DARK_TEXT.1, DARK_TEXT.2);
-        LRESULT(TBCDRF_USECDCOLORS as isize)
+        // Hover/hot halus (bukan putih terang bawaan tema). Visual style toolbar
+        // dimatikan saat gelap (apply_theme) → panah dropdown ▾ ikut clrText (terang)
+        // & highlight pakai clrHighlightHotTrack ini.
+        cd.clrHighlightHotTrack = rgb(58, 63, 75); // #3A3F4B
+        LRESULT((TBCDRF_USECDCOLORS | TBCDRF_HILITEHOTTRACK) as isize)
     } else {
         LRESULT(CDRF_DODEFAULT as isize)
     }
@@ -2570,6 +2584,9 @@ unsafe fn apply_theme(hwnd: HWND) {
         SendMessageW(lv, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
         SendMessageW(lv, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
         SendMessageW(lv, LVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt.0 as isize)));
+        // Header tabel: subclass ListView agar header dirender gelap (proc
+        // menggating via is_dark(), aman saat terang).
+        crate::dark::install_header(lv);
         let _ = InvalidateRect(Some(lv), None, true);
     }
     if let Some(tv) = state::load_hwnd(&state::TREE_HWND) {
@@ -2591,9 +2608,22 @@ unsafe fn apply_theme(hwnd: HWND) {
         if old2.0 != 0 && old2.0 != diml.0 {
             let _ = ImageList_Destroy(Some(HIMAGELIST(old2.0)));
         }
+        // Matikan visual style saat gelap → custom-draw menentukan SEGALANYA:
+        // panah dropdown ▾ ikut clrText (terang) & hover pakai clrHighlightHotTrack
+        // (bukan highlight putih tema). Pulihkan tema default saat terang.
+        if dark {
+            let _ = SetWindowTheme(tb, w!(""), w!(""));
+        } else {
+            let _ = SetWindowTheme(tb, PCWSTR::null(), PCWSTR::null());
+        }
         let _ = InvalidateRect(Some(tb), None, true);
     }
     if let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) {
+        if dark {
+            let _ = SetWindowTheme(ms, w!(""), w!(""));
+        } else {
+            let _ = SetWindowTheme(ms, PCWSTR::null(), PCWSTR::null());
+        }
         let _ = InvalidateRect(Some(ms), None, true);
     }
     // Status bar: warna + (gelap = owner-draw teks).
