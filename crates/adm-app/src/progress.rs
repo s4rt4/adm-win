@@ -24,6 +24,7 @@ const IDC_HIDE: usize = 3;
 const IDC_SL_CHECK: usize = 10;
 const IDC_SL_EDIT: usize = 11;
 const TIMER_ID: usize = 1;
+const ANIM_TIMER: usize = 2;
 
 /// Registry dialog progres terbuka (id → HWND) untuk auto-tutup saat selesai.
 static OPEN_DIALOGS: Mutex<Vec<(u64, isize)>> = Mutex::new(Vec::new());
@@ -40,16 +41,6 @@ pub fn close_for(id: u64) {
         }
     }
 }
-
-// Warna segmen (palet beragam) untuk porsi terunduh.
-const COLORS: [(u8, u8, u8); 6] = [
-    (59, 91, 67),    // hijau logo
-    (217, 180, 4),   // emas logo
-    (70, 130, 180),
-    (176, 96, 64),
-    (120, 90, 160),
-    (80, 150, 120),
-];
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
@@ -143,6 +134,8 @@ unsafe fn register_classes() {
     let seg = WNDCLASSW {
         lpfnWndProc: Some(segbar_proc),
         hInstance: instance,
+        // Byte ekstra window untuk menyimpan fase animasi kilau (SEG_PHASE_IDX).
+        cbWndExtra: std::mem::size_of::<isize>() as i32,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void),
         lpszClassName: SEGBAR_CLASS,
@@ -246,7 +239,7 @@ pub fn open(parent: HWND, id: u64) {
             SEGBAR_CLASS,
             PCWSTR::null(),
             WS_CHILD | WS_VISIBLE,
-            20, 248, 510, 34,
+            20, 248, 510, 18,
             Some(dlg),
             None,
             Some(instance),
@@ -254,6 +247,8 @@ pub fn open(parent: HWND, id: u64) {
         )
         .unwrap_or_default();
         SetWindowLongPtrW(segbar, GWLP_USERDATA, id as isize);
+        // Timer animasi kilau (~30 FPS) — hanya menyapu saat sedang mengunduh.
+        SetTimer(Some(segbar), ANIM_TIMER, 33, None);
         t1.push(segbar);
 
         let conn = mk(
@@ -550,6 +545,15 @@ unsafe fn read_uint(hwnd: HWND) -> u64 {
 
 // ============================ SegmentBar ============================
 
+// Bagian/kondisi tema "PROGRESS" — disamakan dengan progress bar atas
+// (msctls_progress32) agar warna hijau & kilaunya identik.
+const PP_FILL: i32 = 5;
+const PBFS_NORMAL: i32 = 1;
+// Indeks byte ekstra window untuk fase animasi kilau (x bergeser tiap tick).
+const SEG_PHASE_IDX: WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(0);
+// Lebar pita kilau yang menyapu bagian terunduh.
+const GLOSS_W: i32 = 80;
+
 extern "system" fn segbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -558,7 +562,30 @@ extern "system" fn segbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 paint_segbar(hwnd, id);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == ANIM_TIMER => {
+                // Majukan kilau hanya saat sedang mengunduh, agar bar diam
+                // (tak repaint) ketika pause/selesai.
+                let id = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u64;
+                let downloading =
+                    store::get(id).map(|r| r.status == Status::Downloading).unwrap_or(false);
+                if downloading {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let w = (rc.right - rc.left).max(1);
+                    let mut phase = GetWindowLongPtrW(hwnd, SEG_PHASE_IDX) as i32 + 8;
+                    if phase > w {
+                        phase = -GLOSS_W;
+                    }
+                    SetWindowLongPtrW(hwnd, SEG_PHASE_IDX, phase as isize);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
             WM_ERASEBKGND => LRESULT(1),
+            WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), ANIM_TIMER);
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
@@ -570,18 +597,29 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let w = (rc.right - rc.left).max(1);
-    let h = rc.bottom - rc.top;
+    let h = (rc.bottom - rc.top).max(1);
 
-    // Latar.
-    let bg = CreateSolidBrush(rgb(245, 245, 245));
-    FillRect(hdc, &rc, bg);
+    // Double-buffer agar animasi kilau tidak berkedip.
+    let mem = CreateCompatibleDC(Some(hdc));
+    let buf = CreateCompatibleBitmap(hdc, w, h);
+    let old = SelectObject(mem, buf.into());
+
+    // Latar trough (abu terang seperti dasar progress bar atas).
+    let bg = CreateSolidBrush(rgb(230, 230, 230));
+    FillRect(mem, &rc, bg);
     let _ = DeleteObject(bg.into());
 
+    // Tema progress bar = sumber warna hijau & kilau yang sama dengan bar atas.
+    let htheme = OpenThemeData(Some(hwnd), w!("PROGRESS"));
+
     let pending = CreateSolidBrush(rgb(214, 214, 214));
+    let mut filled_rects: Vec<RECT> = Vec::new();
+    let mut downloading = false;
 
     if let Some(r) = store::get(id) {
+        downloading = r.status == Status::Downloading;
         if let Some(total) = r.size.filter(|t| *t > 0) {
-            for (i, (start, end, dl)) in r.segments.iter().enumerate() {
+            for (start, end, dl) in r.segments.iter() {
                 let len = ((*end).saturating_sub(*start) + 1) as i64;
                 let x0 = (*start as i64 * w as i64 / total as i64) as i32;
                 let x1 = ((*end as i64 + 1) * w as i64 / total as i64) as i32;
@@ -591,26 +629,100 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
                     0
                 };
 
-                // Porsi pending.
-                let mut rp = RECT { left: x0, top: 0, right: x1, bottom: h };
-                FillRect(hdc, &rp, pending);
-                // Porsi terunduh.
-                let (cr, cg, cb) = COLORS[i % COLORS.len()];
-                let fill = CreateSolidBrush(rgb(cr, cg, cb));
-                rp.right = x0 + filled;
-                FillRect(hdc, &rp, fill);
-                let _ = DeleteObject(fill.into());
+                // Porsi pending (belum terunduh) di rentang koneksi ini.
+                let rp = RECT { left: x0, top: 0, right: x1, bottom: h };
+                FillRect(mem, &rp, pending);
 
-                // Pemisah segmen.
-                let sep = CreateSolidBrush(rgb(140, 140, 140));
+                // Porsi terunduh — hijau + kilau dari tema (identik bar atas).
+                if filled > 0 {
+                    let rf = RECT { left: x0, top: 0, right: x0 + filled, bottom: h };
+                    let drawn = DrawThemeBackground(htheme, mem, PP_FILL, PBFS_NORMAL, &rf, None);
+                    if drawn.is_err() {
+                        // Tema tak tersedia → fallback hijau progress bar Windows.
+                        let g = CreateSolidBrush(rgb(6, 176, 37));
+                        FillRect(mem, &rf, g);
+                        let _ = DeleteObject(g.into());
+                    }
+                    filled_rects.push(rf);
+                }
+
+                // Pemisah antar koneksi (tipis & halus).
+                let sep = CreateSolidBrush(rgb(150, 150, 150));
                 let line = RECT { left: x1 - 1, top: 0, right: x1, bottom: h };
-                FillRect(hdc, &line, sep);
+                FillRect(mem, &line, sep);
                 let _ = DeleteObject(sep.into());
             }
         }
     }
     let _ = DeleteObject(pending.into());
+    let _ = CloseThemeData(htheme);
+
+    // Kilau bergerak menyapu bagian terunduh — animasi seperti bar atas.
+    if downloading && !filled_rects.is_empty() {
+        let phase = GetWindowLongPtrW(hwnd, SEG_PHASE_IDX) as i32;
+        draw_gloss(mem, &filled_rects, phase, h);
+    }
+
+    let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    let _ = DeleteObject(buf.into());
+    let _ = DeleteDC(mem);
     let _ = EndPaint(hwnd, &ps);
+}
+
+/// Pita kilau translucent yang menyapu, diklip ke area terunduh saja
+/// (alpha per-piksel: transparan di tepi, puncak putih di tengah).
+unsafe fn draw_gloss(hdc: HDC, rects: &[RECT], phase: i32, h: i32) {
+    // Region klip = gabungan semua kotak terunduh.
+    let rgn = CreateRectRgn(0, 0, 0, 0);
+    let tmp = CreateRectRgn(0, 0, 0, 0);
+    for r in rects {
+        let _ = SetRectRgn(tmp, r.left, r.top, r.right, r.bottom);
+        CombineRgn(Some(rgn), Some(rgn), Some(tmp), RGN_OR);
+    }
+    SelectClipRgn(hdc, Some(rgn));
+
+    // DIB 32-bit (alpha per-piksel) berisi pita putih dengan puncak di tengah.
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: GLOSS_W,
+            biHeight: -1, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default() // biCompression = 0 = BI_RGB
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    if let Ok(dib) = CreateDIBSection(Some(hdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        if !bits.is_null() {
+            let px = bits as *mut u32;
+            let half = (GLOSS_W / 2).max(1);
+            for x in 0..GLOSS_W {
+                let t = 1.0 - ((x - half).abs() as f32 / half as f32); // 0..1, puncak tengah
+                let a = (t.max(0.0) * 90.0) as u32; // alpha maksimum kilau
+                // Putih premultiplied (BGRA): keempat byte = a.
+                *px.add(x as usize) = (a << 24) | (a << 16) | (a << 8) | a;
+            }
+            let memdc = CreateCompatibleDC(Some(hdc));
+            let oldb = SelectObject(memdc, dib.into());
+            let blend = BLENDFUNCTION {
+                BlendOp: 0,           // AC_SRC_OVER
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: 1,       // AC_SRC_ALPHA
+            };
+            let _ = AlphaBlend(hdc, phase, 0, GLOSS_W, h, memdc, 0, 0, GLOSS_W, 1, blend);
+            SelectObject(memdc, oldb);
+            let _ = DeleteDC(memdc);
+        }
+        let _ = DeleteObject(dib.into());
+    }
+
+    SelectClipRgn(hdc, None);
+    let _ = DeleteObject(rgn.into());
+    let _ = DeleteObject(tmp.into());
 }
 
 // ============================ Download complete ============================
