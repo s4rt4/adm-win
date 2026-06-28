@@ -249,6 +249,7 @@ pub fn batch_dialog(parent: HWND, initial: &str) -> Option<String> {
             IDCANCEL_BTN,
         );
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -273,6 +274,18 @@ pub fn batch_dialog(parent: HWND, initial: &str) -> Option<String> {
 extern "system" fn batch_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
@@ -426,6 +439,7 @@ pub fn prompt_dialog(parent: HWND, title: &str, label: &str, initial: &str) -> O
             P_CANCEL,
         );
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -450,6 +464,18 @@ pub fn prompt_dialog(parent: HWND, title: &str, label: &str, initial: &str) -> O
 extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
@@ -610,6 +636,7 @@ pub fn columns_dialog(parent: HWND, names: &[&str], current: &[bool]) -> Option<
             C_CANCEL,
         );
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -633,6 +660,18 @@ pub fn columns_dialog(parent: HWND, names: &[&str], current: &[bool]) -> Option<
 extern "system" fn columns_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
@@ -923,6 +962,7 @@ pub fn grabber_dialog(parent: HWND) -> Vec<String> {
             G_CANCEL,
         );
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -965,6 +1005,18 @@ unsafe fn grab_set_title(text: &str) {
 extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {

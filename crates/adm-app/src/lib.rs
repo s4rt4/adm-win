@@ -5,6 +5,7 @@
 
 pub mod autostart;
 pub mod category;
+pub mod dark;
 pub mod dialogs;
 pub mod engine;
 pub mod gui;

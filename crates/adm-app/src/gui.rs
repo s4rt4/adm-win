@@ -2138,6 +2138,7 @@ fn show_about(parent: HWND) {
         .unwrap_or_default();
         SendMessageW(ok, WM_SETFONT, Some(WPARAM(gui_font.0 as usize)), Some(LPARAM(1)));
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -2173,8 +2174,19 @@ extern "system" fn about_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             }
             WM_CTLCOLORSTATIC => {
                 let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let dark = DARK.load(Ordering::SeqCst);
+                let is_link = lparam.0 == *ABOUT_LINK.lock().unwrap();
+                if dark {
+                    // Latar = panel gelap (footer disamakan dgn BG di paint_about).
+                    if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                        if is_link {
+                            SetTextColor(hdc, COLORREF(0x00EF_AF61)); // #61AFEF biru link
+                        }
+                        return r;
+                    }
+                }
                 SetBkMode(hdc, TRANSPARENT);
-                if lparam.0 == *ABOUT_LINK.lock().unwrap() {
+                if is_link {
                     SetTextColor(hdc, COLORREF(0x00CC_6600)); // biru link (BGR)
                 } else {
                     SetTextColor(hdc, COLORREF(0x0020_2020));
@@ -2265,11 +2277,20 @@ unsafe fn paint_about(hwnd: HWND) {
     let (w, h) = (rc.right, rc.bottom);
     let footer_top = h - 56;
 
-    // Panel atas putih, footer abu-abu + garis pemisah.
-    ab_fill(hdc, 0, 0, w, footer_top, 0x00FF_FFFF);
-    ab_fill(hdc, 0, footer_top, w, h, 0x00F3_F3F3);
-    ab_fill(hdc, 0, footer_top, w, footer_top + 1, 0x00DE_DEDE);
-    ab_fill(hdc, 28, 150, w - 28, 151, 0x00EC_ECEC);
+    // Warna sadar-tema (One Dark Pro saat gelap). Di gelap panel & footer
+    // disamakan (BG) agar latar kontrol-anak link menyatu.
+    let dark = DARK.load(Ordering::SeqCst);
+    let (c_panel, c_footer, c_sep, c_thin, c_title, c_sub, c_ver, c_copy) = if dark {
+        (0x0034_2C28, 0x0034_2C28, 0x0045_3D38, 0x0030_2A26, 0x00BF_B2AB, 0x00A0_9890, 0x00C0_B8B0, 0x0090_8880)
+    } else {
+        (0x00FF_FFFF, 0x00F3_F3F3, 0x00DE_DEDE, 0x00EC_ECEC, 0x0020_2020, 0x006E_6E6E, 0x0040_4040, 0x0080_8080)
+    };
+
+    // Panel atas, footer + garis pemisah.
+    ab_fill(hdc, 0, 0, w, footer_top, c_panel);
+    ab_fill(hdc, 0, footer_top, w, h, c_footer);
+    ab_fill(hdc, 0, footer_top, w, footer_top + 1, c_sep);
+    ab_fill(hdc, 28, 150, w - 28, 151, c_thin);
 
     // Logo.
     let ic = *ABOUT_ICON.lock().unwrap();
@@ -2283,7 +2304,7 @@ unsafe fn paint_about(hwnd: HWND) {
     // Judul.
     let f = ab_font(-26, 700);
     let prev = SelectObject(hdc, f.into());
-    SetTextColor(hdc, COLORREF(0x0020_2020));
+    SetTextColor(hdc, COLORREF(c_title));
     ab_text(hdc, "Alpha Download Manager", tx, 32);
     SelectObject(hdc, prev);
     let _ = DeleteObject(f.into());
@@ -2291,7 +2312,7 @@ unsafe fn paint_about(hwnd: HWND) {
     // Subjudul.
     let f = ab_font(-15, 400);
     let prev = SelectObject(hdc, f.into());
-    SetTextColor(hdc, COLORREF(0x006E_6E6E));
+    SetTextColor(hdc, COLORREF(c_sub));
     ab_text(hdc, "Native Windows download manager", tx + 2, 68);
     SelectObject(hdc, prev);
     let _ = DeleteObject(f.into());
@@ -2300,7 +2321,7 @@ unsafe fn paint_about(hwnd: HWND) {
     let vtext = format!("Version {ABOUT_VERSION}");
     let f = ab_font(-16, 600);
     let prev = SelectObject(hdc, f.into());
-    SetTextColor(hdc, COLORREF(0x0040_4040));
+    SetTextColor(hdc, COLORREF(c_ver));
     ab_text(hdc, &vtext, tx + 2, 100);
     let vw = ab_text_width(hdc, &vtext);
     SelectObject(hdc, prev);
@@ -2328,7 +2349,7 @@ unsafe fn paint_about(hwnd: HWND) {
     // Hak cipta + catatan status (di bawah pemisah; tautan repo = child control).
     let f = ab_font(-13, 400);
     let prev = SelectObject(hdc, f.into());
-    SetTextColor(hdc, COLORREF(0x0080_8080));
+    SetTextColor(hdc, COLORREF(c_copy));
     ab_text(hdc, "\u{00A9} 2026 s4rt4 \u{00B7} Released under the MIT License", 28, 192);
     ab_text(hdc, "Early pre-release \u{2014} expect bugs and breaking changes.", 28, 212);
     SelectObject(hdc, prev);

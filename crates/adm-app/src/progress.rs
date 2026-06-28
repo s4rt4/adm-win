@@ -339,6 +339,7 @@ pub fn open(parent: HWND, id: u64) {
         }
         refresh(dlg);
         SetTimer(Some(dlg), TIMER_ID, 400, None);
+        crate::dark::apply(dlg);
         let _ = ShowWindow(dlg, SW_SHOW);
     }
 }
@@ -464,12 +465,20 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLORSTATIC => {
-                // Label berada di atas tab control (badan putih saat bertema);
-                // pakai brush window (putih) + teks transparan agar menyatu,
-                // bukan kotak abu-abu (COLOR_BTNFACE).
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                // Terang: label di atas tab control (badan putih) → brush window
+                // (putih) + teks transparan agar menyatu, bukan kotak abu-abu.
                 SetBkMode(HDC(wparam.0 as *mut _), TRANSPARENT);
                 LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
@@ -827,6 +836,7 @@ pub fn show_complete(parent: HWND, row: &Row) {
         let chk = mk(dlg, w!("BUTTON"), w!("Don't show this dialog again"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 16, 206, 260, 20, IDC_DONTSHOW);
         *CMPL_DONTSHOW.lock().unwrap() = chk.0 as isize;
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -888,9 +898,18 @@ extern "system" fn cmpl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLORSTATIC => {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
                 SetBkMode(HDC(wparam.0 as *mut _), TRANSPARENT);
                 LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CLOSE => {
                 CMPL_DONE.store(true, Ordering::SeqCst);

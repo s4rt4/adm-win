@@ -159,6 +159,7 @@ pub fn show(parent: HWND) {
         let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 264, 200, 84, 30, ID_OK);
         let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 356, 200, 84, 30, ID_CANCEL);
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -225,9 +226,18 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLORSTATIC => {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
                 SetBkMode(HDC(wparam.0 as *mut _), TRANSPARENT);
                 LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CLOSE => {
                 DONE.store(true, Ordering::SeqCst);

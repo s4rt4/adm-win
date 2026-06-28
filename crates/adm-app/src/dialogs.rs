@@ -291,6 +291,7 @@ fn dialog_impl(
             400, btn_y, 100, 30, IDCANCEL, instance,
         );
 
+        crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
@@ -420,6 +421,18 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 DONE.store(true, Ordering::SeqCst);
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+                if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                if let Some(r) = crate::dark::erasebkgnd(hwnd, wparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
