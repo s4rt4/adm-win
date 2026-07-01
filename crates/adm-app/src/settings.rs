@@ -22,6 +22,10 @@ pub struct Settings {
     pub language: String,
     /// tampilkan dialog "Download complete" saat unduhan selesai (§9.14).
     pub show_complete_dialog: bool,
+    /// path yt-dlp.exe (None = auto: folder aplikasi → PATH).
+    pub youtube_ytdlp: Option<String>,
+    /// path ffmpeg.exe (None = auto: folder aplikasi → PATH).
+    pub youtube_ffmpeg: Option<String>,
 }
 
 impl Default for Settings {
@@ -34,6 +38,8 @@ impl Default for Settings {
             autostart: false,
             language: "en".into(),
             show_complete_dialog: true,
+            youtube_ytdlp: None,
+            youtube_ffmpeg: None,
         }
     }
 }

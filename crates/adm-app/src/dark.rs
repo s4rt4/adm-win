@@ -46,6 +46,9 @@ unsafe fn cached_brush(slot: &Mutex<isize>, color: (u8, u8, u8)) -> HBRUSH {
 
 /// Terapkan dark ke window dialog + semua anaknya. Panggil SETELAH semua kontrol
 /// anak dibuat (mis. tepat sebelum `ShowWindow`). No-op bila tema terang.
+///
+/// # Safety
+/// `hwnd` harus window valid; panggil dari thread pemilik window (UI thread).
 pub unsafe fn apply(hwnd: HWND) {
     if !is_dark() {
         return;
@@ -85,6 +88,9 @@ unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
 /// Tangani `WM_CTLCOLOR*` (STATIC/EDIT/BTN/LISTBOX/DLG/SCROLLBAR). Kembalikan
 /// `Some(brush)` sbg LRESULT bila dark aktif; `None` → biarkan proc pakai default.
 /// `wparam` = HDC kontrol.
+///
+/// # Safety
+/// `wparam.0` harus HDC valid (dari pesan `WM_CTLCOLOR*` yang sedang ditangani).
 pub unsafe fn ctlcolor(msg: u32, wparam: WPARAM) -> Option<LRESULT> {
     if !is_dark() {
         return None;
@@ -106,6 +112,9 @@ pub unsafe fn ctlcolor(msg: u32, wparam: WPARAM) -> Option<LRESULT> {
 
 /// Isi latar dialog dengan warna gelap saat `WM_ERASEBKGND`. Kembalikan
 /// `Some(LRESULT(1))` bila ditangani (dark), `None` bila terang.
+///
+/// # Safety
+/// `hwnd` harus window valid dan `wparam.0` HDC valid (dari `WM_ERASEBKGND`).
 pub unsafe fn erasebkgnd(hwnd: HWND, wparam: WPARAM) -> Option<LRESULT> {
     if !is_dark() {
         return None;
@@ -121,6 +130,9 @@ pub unsafe fn erasebkgnd(hwnd: HWND, wparam: WPARAM) -> Option<LRESULT> {
 /// gelap — notifikasi NM_CUSTOMDRAW header dikirim ke ListView, bukan ke window
 /// utama. Aman dipanggil berulang (uIdSubclass sama = perbarui, tak menumpuk).
 /// Proc menggating sendiri via `is_dark()`, jadi tetap benar saat tema terang.
+///
+/// # Safety
+/// `lv` harus handle ListView (`SysListView32`) valid.
 pub unsafe fn install_header(lv: HWND) {
     let _ = SetWindowSubclass(lv, Some(lv_subclass), HEADER_SUBCLASS_ID, 0);
     // Paksa header repaint agar warna langsung ikut.
@@ -182,7 +194,7 @@ unsafe fn header_customdraw(lparam: LPARAM) -> Option<LRESULT> {
         cchTextMax: 128,
         ..Default::default()
     };
-    let idx = cd.dwItemSpec as usize;
+    let idx = cd.dwItemSpec;
     SendMessageW(
         cd.hdr.hwndFrom,
         HDM_GETITEMW,

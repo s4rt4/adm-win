@@ -22,12 +22,16 @@ const ID_DIR: usize = 1;
 const ID_QUEUE: usize = 2;
 const ID_LIMIT: usize = 3;
 const ID_AUTOSTART: usize = 4;
+const ID_YTDLP: usize = 5;
+const ID_FFMPEG: usize = 6;
 const ID_BROWSE: usize = 10;
+const ID_BROWSE_YTDLP: usize = 11;
+const ID_BROWSE_FFMPEG: usize = 12;
 const ID_OK: usize = 20;
 const ID_CANCEL: usize = 21;
 
-// 0 dir, 1 queue, 2 limit, 3 autostart
-static CTRL: Mutex<[isize; 4]> = Mutex::new([0; 4]);
+// 0 dir, 1 queue, 2 limit, 3 autostart, 4 yt-dlp, 5 ffmpeg
+static CTRL: Mutex<[isize; 6]> = Mutex::new([0; 6]);
 
 fn set_ctrl(i: usize, h: HWND) {
     CTRL.lock().unwrap()[i] = h.0 as isize;
@@ -105,7 +109,7 @@ pub fn show(parent: HWND) {
         // Ukuran CLIENT yang diinginkan → window dibesarkan agar tombol bawah
         // tidak terpotong oleh caption/border.
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-        let mut rc = RECT { left: 0, top: 0, right: 460, bottom: 246 };
+        let mut rc = RECT { left: 0, top: 0, right: 460, bottom: 348 };
         let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
         let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
         let mut pr = RECT::default();
@@ -155,9 +159,23 @@ pub fn show(parent: HWND) {
         SendMessageW(a, BM_SETCHECK, Some(WPARAM(if cfg.autostart { 1 } else { 0 })), Some(LPARAM(0)));
         set_ctrl(3, a);
 
+        // Lokasi yt-dlp (menu YouTube) — kosong = auto (folder app → PATH).
+        let _ = mk(dlg, w!("STATIC"), w!("yt-dlp path (empty = auto-detect):"), WINDOW_STYLE(0), M, 190, 300, 16, 0);
+        let yt = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32), M, 210, FW - 86, EH, ID_YTDLP);
+        set_text(yt, cfg.youtube_ytdlp.as_deref().unwrap_or(""));
+        let _ = mk(dlg, w!("BUTTON"), w!("Browse..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), M + FW - 80, 209, 80, EH + 2, ID_BROWSE_YTDLP);
+        set_ctrl(4, yt);
+
+        // Lokasi ffmpeg.
+        let _ = mk(dlg, w!("STATIC"), w!("ffmpeg path (empty = auto-detect):"), WINDOW_STYLE(0), M, 246, 300, 16, 0);
+        let ff = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32), M, 266, FW - 86, EH, ID_FFMPEG);
+        set_text(ff, cfg.youtube_ffmpeg.as_deref().unwrap_or(""));
+        let _ = mk(dlg, w!("BUTTON"), w!("Browse..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), M + FW - 80, 265, 80, EH + 2, ID_BROWSE_FFMPEG);
+        set_ctrl(5, ff);
+
         // Tombol (rata kanan di tepi bawah area klien).
-        let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 264, 200, 84, 30, ID_OK);
-        let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 356, 200, 84, 30, ID_CANCEL);
+        let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 264, 302, 84, 30, ID_OK);
+        let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 356, 302, 84, 30, ID_CANCEL);
 
         crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
@@ -183,12 +201,16 @@ pub fn show(parent: HWND) {
             let queue_max = get_text(ctrl(1)).trim().parse::<usize>().unwrap_or(1).max(1);
             let limit = get_text(ctrl(2)).trim().parse::<u64>().unwrap_or(0);
             let auto = SendMessageW(ctrl(3), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
+            let ytdlp = get_text(ctrl(4)).trim().to_string();
+            let ffmpeg = get_text(ctrl(5)).trim().to_string();
 
             settings::update(|s| {
                 s.download_dir = if dir.is_empty() { None } else { Some(dir.clone()) };
                 s.queue_max = queue_max;
                 s.global_limit_kbps = limit;
                 s.autostart = auto;
+                s.youtube_ytdlp = if ytdlp.is_empty() { None } else { Some(ytdlp.clone()) };
+                s.youtube_ffmpeg = if ffmpeg.is_empty() { None } else { Some(ffmpeg.clone()) };
             });
 
             if let Some(e) = crate::gui::engine() {
@@ -220,6 +242,16 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     ID_BROWSE => {
                         if let Some(p) = crate::tasks::pick_folder(hwnd, "Pilih folder unduhan") {
                             set_text(ctrl(0), &p.to_string_lossy());
+                        }
+                    }
+                    ID_BROWSE_YTDLP => {
+                        if let Some(p) = crate::tasks::pick_exe(hwnd, "Pilih yt-dlp.exe") {
+                            set_text(ctrl(4), &p.to_string_lossy());
+                        }
+                    }
+                    ID_BROWSE_FFMPEG => {
+                        if let Some(p) = crate::tasks::pick_exe(hwnd, "Pilih ffmpeg.exe") {
+                            set_text(ctrl(5), &p.to_string_lossy());
                         }
                     }
                     _ => {}

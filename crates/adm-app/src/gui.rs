@@ -32,8 +32,10 @@ static SORT_ASC: AtomicBool = AtomicBool::new(true);
 /// Tema gelap aktif (dibaca WndProc untuk custom-draw).
 static DARK: AtomicBool = AtomicBool::new(false);
 static STATUS_TEXT: Mutex<String> = Mutex::new(String::new());
-/// HMENU 5 popup menu utama (Tasks/File/Downloads/View/About).
-static MENUS: Mutex<[isize; 5]> = Mutex::new([0; 5]);
+/// HMENU 6 popup menu utama (Tasks/File/Downloads/View/YouTube/About).
+static MENUS: Mutex<[isize; 6]> = Mutex::new([0; 6]);
+/// Indeks tombol menu-strip "YouTube" (untuk disable + tooltip).
+const MENU_YOUTUBE_IDX: usize = 4;
 
 // Dialog About (custom owner-draw).
 static ABOUT_REG: AtomicBool = AtomicBool::new(false);
@@ -131,6 +133,12 @@ const ID_FONT: usize = 0x138;
 const ID_LANGUAGE: usize = 0x139;
 
 const ID_ABOUT: usize = 0x142;
+
+// Menu YouTube (yt-dlp).
+const ID_YT_VIDEO: usize = 0x1B0;
+const ID_YT_AUDIO: usize = 0x1B1;
+const ID_YT_VIDEO_ONLY: usize = 0x1B2;
+const ID_YT_PLAYLIST: usize = 0x1B3;
 
 const ID_RESUME: usize = 0x150;
 const ID_DELETE: usize = 0x151;
@@ -490,7 +498,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         w!("ToolbarWindow32"),
         PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBSTYLE_FLAT | TBSTYLE_LIST | (CCS_NODIVIDER | CCS_NORESIZE | CCS_NOPARENTALIGN) as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS | (CCS_NODIVIDER | CCS_NORESIZE | CCS_NOPARENTALIGN) as u32),
         0, 0, 0, 0,
         Some(hwnd),
         None,
@@ -500,12 +508,16 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     .unwrap_or_default();
     SendMessageW(ms, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
     let mut mb: Vec<TBBUTTON> = Vec::new();
-    for (i, label) in ["Tasks", "File", "Downloads", "View", "About"].iter().enumerate() {
+    for (i, label) in ["Tasks", "File", "Downloads", "View", "YouTube", "About"].iter().enumerate() {
         mkbtn(&mut mb, ID_MENU_BASE + i, label, -2, false);
     }
     SendMessageW(ms, TB_ADDBUTTONSW, Some(WPARAM(mb.len())), Some(LPARAM(mb.as_ptr() as isize)));
     SendMessageW(ms, TB_SETINDENT, Some(WPARAM(10)), Some(LPARAM(0))); // jangan mepet kiri
     SendMessageW(ms, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
+    // Menu YouTube di-disable bila yt-dlp/ffmpeg tak terpasang (tooltip menjelaskan).
+    if !crate::youtube::available() {
+        SendMessageW(ms, TB_ENABLEBUTTON, Some(WPARAM(ID_MENU_BASE + MENU_YOUTUBE_IDX)), Some(LPARAM(0)));
+    }
     state::store_hwnd(&state::MENUSTRIP_HWND, ms);
 
     // Toolbar.
@@ -729,6 +741,13 @@ unsafe fn build_menus() {
     THEME_MENU.store(theme.0 as isize, Ordering::SeqCst);
     let _ = AppendMenuW(view, MF_POPUP, theme.0 as usize, w!("Theme"));
 
+    let youtube = CreatePopupMenu().unwrap();
+    append(youtube, ID_YT_VIDEO, w!("Download video (with audio)..."));
+    append(youtube, ID_YT_AUDIO, w!("Download audio only..."));
+    append(youtube, ID_YT_VIDEO_ONLY, w!("Download video without audio..."));
+    sep(youtube);
+    append(youtube, ID_YT_PLAYLIST, w!("Download playlist / channel..."));
+
     let about = CreatePopupMenu().unwrap();
     append(about, ID_ABOUT, w!("About ADM"));
 
@@ -737,6 +756,7 @@ unsafe fn build_menus() {
         file.0 as isize,
         dl.0 as isize,
         view.0 as isize,
+        youtube.0 as isize,
         about.0 as isize,
     ];
 }
@@ -1019,6 +1039,20 @@ fn status_text(r: &store::Row) -> String {
 
 unsafe fn handle_notify(hwnd: HWND, lparam: LPARAM) {
     let hdr = &*(lparam.0 as *const NMHDR);
+
+    // Tooltip menu-strip: hanya tombol "YouTube" saat di-disable (biner hilang).
+    if hdr.code == TTN_GETDISPINFOW
+        && hdr.idFrom == ID_MENU_BASE + MENU_YOUTUBE_IDX
+        && !crate::youtube::available()
+    {
+        let di = &mut *(lparam.0 as *mut NMTTDISPINFOW);
+        let mut wide: Vec<u16> = crate::youtube::missing_tooltip().encode_utf16().take(79).collect();
+        wide.push(0);
+        di.szText[..wide.len()].copy_from_slice(&wide);
+        di.lpszText = PWSTR(di.szText.as_mut_ptr());
+        return;
+    }
+
     let lv = state::load_hwnd(&state::LIST_HWND);
     let tb = state::load_hwnd(&state::TOOLBAR_HWND);
     let tv = state::load_hwnd(&state::TREE_HWND);
@@ -1197,6 +1231,11 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if let Some(e) = ENGINE.get() {
                 let ids = selected_ids();
                 for id in &ids {
+                    // Baris playlist → buka jendela progresnya (resume per-item di sana).
+                    if crate::youtube_playlist::is_playlist(*id) {
+                        crate::youtube_playlist::open_window(hwnd, *id);
+                        continue;
+                    }
                     if let Some(r) = store::get(*id) {
                         let fname = r.filename();
                         e.resume(*id, r.url, fname, r.insecure, r.referrer, r.user_agent, r.cookies);
@@ -1204,9 +1243,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 }
                 if !ids.is_empty() {
                     refresh_ui(hwnd);
-                    // Buka dialog status hanya bila satu yang diseleksi — hindari
-                    // banyak dialog menumpuk saat resume massal.
-                    if ids.len() == 1 {
+                    // Buka dialog status hanya bila satu yang diseleksi & bukan playlist.
+                    if ids.len() == 1 && !crate::youtube_playlist::is_playlist(ids[0]) {
                         crate::progress::open(hwnd, ids[0]);
                     }
                 }
@@ -1215,7 +1253,11 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_STOP => {
             if let Some(e) = ENGINE.get() {
                 for id in selected_ids() {
-                    e.cancel(id);
+                    if crate::youtube_playlist::is_playlist(id) {
+                        crate::youtube_playlist::pause(id);
+                    } else {
+                        e.cancel(id);
+                    }
                 }
             }
         }
@@ -1223,6 +1265,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if let Some(e) = ENGINE.get() {
                 e.cancel_all();
             }
+            crate::youtube_playlist::pause_all();
         }
         ID_REMOVE => remove_selected(hwnd, false),
         ID_DELETE => remove_selected(hwnd, true),
@@ -1270,6 +1313,10 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_THEME_LIGHT => set_theme(hwnd, crate::settings::THEME_LIGHT),
         ID_THEME_SYSTEM => set_theme(hwnd, crate::settings::THEME_SYSTEM),
         ID_ABOUT => show_about(hwnd),
+        ID_YT_VIDEO => yt_download(hwnd, crate::youtube::Mode::Video),
+        ID_YT_AUDIO => yt_download(hwnd, crate::youtube::Mode::AudioOnly),
+        ID_YT_VIDEO_ONLY => yt_download(hwnd, crate::youtube::Mode::VideoOnly),
+        ID_YT_PLAYLIST => yt_playlist(hwnd),
         ID_EXIT => request_exit(hwnd),
         // Fitur milestone lain.
         ID_SCHEDULER => crate::scheduler::show(hwnd),
@@ -1327,7 +1374,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_TRAY_EXIT => request_exit(hwnd),
         m if (ID_MOVE_BASE..ID_MOVE_BASE + 6).contains(&m) => do_move(hwnd, m - ID_MOVE_BASE),
-        m if (ID_MENU_BASE..ID_MENU_BASE + 5).contains(&m) => open_menu(hwnd, m - ID_MENU_BASE),
+        m if (ID_MENU_BASE..ID_MENU_BASE + 6).contains(&m) => open_menu(hwnd, m - ID_MENU_BASE),
         _ => {}
     }
 }
@@ -1392,6 +1439,35 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
 
 unsafe fn do_add(hwnd: HWND) {
     show_add(hwnd, None);
+}
+
+/// Buka dialog YouTube (mode terpilih) lalu mulai unduhan via yt-dlp.
+unsafe fn yt_download(hwnd: HWND, mode: crate::youtube::Mode) {
+    if !crate::youtube::available() {
+        info(hwnd, &crate::youtube::missing_tooltip());
+        return;
+    }
+    let Some(req) = crate::youtube::show_dialog(hwnd, mode) else { return };
+    let Some(engine) = ENGINE.get() else { return };
+    if let Some(id) = crate::youtube::start(engine, req) {
+        // Daftarkan dialog progres sebelum refresh (lihat catatan di show_add).
+        crate::progress::open(hwnd, id);
+        refresh_ui(hwnd);
+    }
+}
+
+/// Buka dialog playlist/channel lalu mulai manajer + jendela progres khusus.
+unsafe fn yt_playlist(hwnd: HWND) {
+    if !crate::youtube::available() {
+        info(hwnd, &crate::youtube::missing_tooltip());
+        return;
+    }
+    let Some(job) = crate::youtube_playlist::show_dialog(hwnd) else { return };
+    let Some(engine) = ENGINE.get() else { return };
+    if let Some(id) = crate::youtube_playlist::start(engine, job) {
+        crate::youtube_playlist::open_window(hwnd, id);
+        refresh_ui(hwnd);
+    }
 }
 
 /// Tampilkan dialog "Download File Info". `incoming` = titipan dari browser
@@ -1762,6 +1838,10 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
         if let Some(e) = engine {
             e.cancel(id);
         }
+        // Baris playlist → hentikan & lepas manajernya (+ tutup jendela progres).
+        if crate::youtube_playlist::is_playlist(id) {
+            crate::youtube_playlist::remove(id);
+        }
         if let Some(row) = store::remove(id) {
             if delete_file {
                 let _ = std::fs::remove_file(&row.output);
@@ -1779,7 +1859,10 @@ unsafe fn on_dblclick(hwnd: HWND, index: i32) {
     let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return };
     let Some(id) = item_id(lv, index) else { return };
     let Some(row) = store::get(id) else { return };
-    if row.status == store::Status::Complete {
+    if crate::youtube_playlist::is_playlist(id) {
+        // Baris agregat playlist → jendela progres khusus (bukan dialog tunggal).
+        crate::youtube_playlist::open_window(hwnd, id);
+    } else if row.status == store::Status::Complete {
         let h = HSTRING::from(row.output.to_string_lossy().into_owned());
         ShellExecuteW(None, w!("open"), PCWSTR(h.as_ptr()), None, None, SW_SHOWNORMAL);
     } else {

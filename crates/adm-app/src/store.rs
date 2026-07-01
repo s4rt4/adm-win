@@ -297,6 +297,14 @@ pub fn get(id: u64) -> Option<Row> {
     ROWS.lock().unwrap().iter().find(|r| r.id == id).cloned()
 }
 
+/// Perbarui hanya teks nama tampilan baris (mis. baris agregat playlist
+/// "Playlist: X (3/12)"); tak mengubah output/kategori.
+pub fn set_name(id: u64, name: &str) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.name = name.to_string();
+    }
+}
+
 /// Perbarui path output + nama + kategori (mis. setelah koreksi nama).
 pub fn set_output(id: u64, output: PathBuf) {
     if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {

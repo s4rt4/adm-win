@@ -746,6 +746,35 @@ pub fn save_dialog(parent: HWND) -> Option<PathBuf> {
     }
 }
 
+/// Pilih berkas executable (mis. yt-dlp.exe / ffmpeg.exe) untuk Options.
+pub fn pick_exe(parent: HWND, title: &str) -> Option<PathBuf> {
+    unsafe {
+        let mut buf = [0u16; 1024];
+        let mut filter: Vec<u16> = Vec::new();
+        for part in ["Executable (*.exe)", "*.exe", "All files (*.*)", "*.*"] {
+            filter.extend(part.encode_utf16());
+            filter.push(0);
+        }
+        filter.push(0);
+        let th: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: parent,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: PWSTR(buf.as_mut_ptr()),
+            nMaxFile: buf.len() as u32,
+            lpstrTitle: PCWSTR(th.as_ptr()),
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
+            ..Default::default()
+        };
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            Some(PathBuf::from(pwstr_to_string(&buf)))
+        } else {
+            None
+        }
+    }
+}
+
 /// Pilih file daftar URL untuk diimpor.
 pub fn open_dialog(parent: HWND) -> Option<PathBuf> {
     unsafe {

@@ -149,6 +149,40 @@ impl EngineHandle {
         id
     }
 
+    // ---- Unduhan eksternal (mis. yt-dlp) --------------------------------
+    // Engine tak tahu detail proses eksternal; ia hanya menyediakan primitif
+    // agar unduhan tsb tampil sebagai baris list biasa & bisa di-Stop lewat
+    // jalur cancel yang sama (Stop / Stop All). Runner-nya (youtube.rs)
+    // memanggil `emit` untuk mengalirkan event dan `register`/`unregister`
+    // untuk mendaftarkan token pembatalan.
+
+    /// Alokasikan id unduhan baru (tanpa memulai apa pun).
+    pub fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Emit event engine (dipakai runner eksternal untuk lapor progres/selesai).
+    pub fn emit(&self, ev: EngineEvent) {
+        (self.sink)(ev);
+    }
+
+    /// Daftarkan token pembatalan untuk unduhan eksternal `id`; `cancel(id)` /
+    /// `cancel_all` / `stop_queue` akan men-set token ini (runner memantau &
+    /// membunuh proses). Kembalikan token untuk dipantau runner.
+    pub fn register(&self, id: u64) -> CancelToken {
+        let token = CancelToken::new();
+        self.active
+            .lock()
+            .unwrap()
+            .insert(id, (token.clone(), Arc::new(Limiter::unlimited())));
+        token
+    }
+
+    /// Lepas pendaftaran unduhan eksternal (dipanggil runner saat selesai/gagal).
+    pub fn unregister(&self, id: u64) {
+        self.active.lock().unwrap().remove(&id);
+    }
+
     /// Lanjutkan unduhan yang sudah ada (segera). `insecure` mengabaikan
     /// verifikasi sertifikat TLS; header titipan (referrer/UA/cookie) diberikan
     /// pemanggil dari baris store (dipersist), agar resume ber-auth tetap jalan

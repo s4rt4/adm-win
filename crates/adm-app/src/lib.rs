@@ -19,6 +19,8 @@ pub mod state;
 pub mod store;
 pub mod tasks;
 pub mod theme;
+pub mod youtube;
+pub mod youtube_playlist;
 
 use std::path::PathBuf;
 
