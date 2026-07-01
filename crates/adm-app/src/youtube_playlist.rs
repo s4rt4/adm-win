@@ -529,7 +529,7 @@ pub fn show_dialog(parent: HWND) -> Option<PlaylistJob> {
 
         // Resolusi.
         let _ = mk(dlg, w!("STATIC"), w!("Resolution:"), WINDOW_STYLE(0), M + 300, 326, 70, 16, 0);
-        let res = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0), M + 372, 324, 180, 200, DID_RES);
+        let res = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()), M + 372, 324, 180, 200, DID_RES);
         for (label, _) in RESOLUTIONS {
             let h = HSTRING::from(label);
             SendMessageW(res, CB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(h.as_ptr() as isize)));
@@ -679,6 +679,12 @@ extern "system" fn d_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
                 }
                 LRESULT(0)
             }
+            WM_DRAWITEM => {
+                if let Some(r) = crate::dark::draw_combobox(lparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
                 if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
                     return r;
@@ -754,7 +760,7 @@ pub fn open_window(parent: HWND, id: u64) {
         }
 
         let title = HSTRING::from(format!("Playlist: {}", mgr.name));
-        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX;
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
         let mut rc = RECT { left: 0, top: 0, right: 640, bottom: 440 };
         let _ = AdjustWindowRectEx(&mut rc, style, false, WINDOW_EX_STYLE::default());
         let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -795,6 +801,7 @@ pub fn open_window(parent: HWND, id: u64) {
         SetWindowLongPtrW(dlg, GWLP_USERDATA, Box::into_raw(data) as isize);
         W_OPEN.lock().unwrap().push((id, dlg.0 as isize));
 
+        w_layout(dlg);
         w_refresh(dlg);
         SetTimer(Some(dlg), W_TIMER, 500, None);
         crate::dark::apply(dlg);
@@ -812,6 +819,43 @@ fn visible_map(mgr: &Arc<Manager>) -> Vec<usize> {
         .filter(|(_, it)| it.status != ItemStatus::Removed)
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Reflow kontrol mengikuti ukuran window: list mengisi area atas, bar+label
+/// tepat di atas baris tombol, tombol menempel di tepi bawah, Title menyerap
+/// sisa lebar. Dipanggil sekali saat buka + tiap `WM_SIZE`.
+unsafe fn w_layout(hwnd: HWND) {
+    let Some(d) = win_data(hwnd) else { return };
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let (cw, ch) = (rc.right, rc.bottom);
+    const M: i32 = 10;
+    const BH: i32 = 30; // tinggi baris tombol
+    const BARH: i32 = 18; // tinggi bar agregat
+
+    let btn_y = ch - M - BH;
+    let bar_y = btn_y - 12 - BARH;
+    let list_h = (bar_y - M - M).max(60);
+    let _ = MoveWindow(d.list, M, M, (cw - 2 * M).max(80), list_h, true);
+
+    // Bar agregat + label "done/total" (label rata kanan).
+    const LBL_W: i32 = 94;
+    let lbl_x = cw - M - LBL_W;
+    let bar_w = (lbl_x - M - M).max(60);
+    let _ = MoveWindow(d.bar, M, bar_y, bar_w, BARH, true);
+    let _ = MoveWindow(d.lbl, lbl_x, bar_y + 1, LBL_W, 16, true);
+
+    // Tombol: tiga di kiri, Close menempel kanan.
+    let btn = |id: usize| GetDlgItem(Some(hwnd), id as i32).unwrap_or_default();
+    let _ = MoveWindow(btn(WID_RESUME), M, btn_y, 130, BH, true);
+    let _ = MoveWindow(btn(WID_DELETE), M + 138, btn_y, 130, BH, true);
+    let _ = MoveWindow(btn(WID_STOP), M + 276, btn_y, 100, BH, true);
+    let _ = MoveWindow(btn(WID_CLOSE), cw - M - 100, btn_y, 100, BH, true);
+
+    // Title menyerap sisa lebar (kolom lain tetap: #, Status, Speed, Progress).
+    let others = 34 + 80 + 88 + 100;
+    let title_w = ((cw - 2 * M) - others - 24).max(120); // 24 ~ border + scrollbar
+    SendMessageW(d.list, LVM_SETCOLUMNWIDTH, Some(WPARAM(1)), Some(LPARAM(title_w as isize)));
 }
 
 unsafe fn w_refresh(hwnd: HWND) {
@@ -973,6 +1017,16 @@ extern "system" fn w_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
         match msg {
             WM_TIMER => {
                 w_refresh(hwnd);
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                w_layout(hwnd);
+                LRESULT(0)
+            }
+            WM_GETMINMAXINFO => {
+                let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
+                mmi.ptMinTrackSize.x = 460;
+                mmi.ptMinTrackSize.y = 320;
                 LRESULT(0)
             }
             WM_NOTIFY => {
