@@ -852,7 +852,7 @@ pub fn show_dialog(parent: HWND, initial: Mode) -> Option<YtRequest> {
 
         // Mode.
         let _ = mk(dlg, w!("STATIC"), w!("Download:"), WINDOW_STYLE(0), M, 98, 70, 16, 0);
-        let m = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0), 96, 96, 250, 200, ID_MODE);
+        let m = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()), 96, 96, 250, 200, ID_MODE);
         for (label, _) in MODES {
             combo_add(m, label);
         }
@@ -862,7 +862,7 @@ pub fn show_dialog(parent: HWND, initial: Mode) -> Option<YtRequest> {
 
         // Resolusi.
         let _ = mk(dlg, w!("STATIC"), w!("Resolution:"), WINDOW_STYLE(0), M, 130, 70, 16, 0);
-        let r = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0), 96, 128, 180, 200, ID_RES);
+        let r = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()), 96, 128, 180, 200, ID_RES);
         for (label, _) in RESOLUTIONS {
             combo_add(r, label);
         }
@@ -978,6 +978,12 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     }
                 }
                 LRESULT(0)
+            }
+            WM_DRAWITEM => {
+                if let Some(r) = crate::dark::draw_combobox(lparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
                 if let Some(r) = crate::dark::ctlcolor(msg, wparam) {

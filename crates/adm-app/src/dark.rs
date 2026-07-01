@@ -19,6 +19,7 @@ const EDIT_BG: (u8, u8, u8) = (30, 33, 39); // #1E2127 field input (sedikit lebi
 const TEXT: (u8, u8, u8) = (171, 178, 191); // #ABB2BF teks
 const HEADER_BG: (u8, u8, u8) = (45, 50, 59); // #2D323B header tabel (sedikit > body)
 const HEADER_SEP: (u8, u8, u8) = (60, 66, 76); // pemisah kolom header (halus)
+const SEL_BG: (u8, u8, u8) = (58, 63, 75); // sorotan item combo/list terpilih
 
 // ID subclass header (arbitrer, unik per kelas subclass).
 const HEADER_SUBCLASS_ID: usize = 0x00AD_0001;
@@ -81,6 +82,10 @@ unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
     } else if name.eq_ignore_ascii_case("SysTreeView32") {
         SendMessageW(child, TVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
         SendMessageW(child, TVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt)));
+    } else if name.eq_ignore_ascii_case("ComboBox") {
+        // Tombol dropdown ▾ combobox tetap putih walau DarkMode_Explorer → subclass
+        // untuk meng-overpaint tombol gelap. (Permukaan sudah owner-draw dark.)
+        install_combo(child);
     }
     BOOL(1)
 }
@@ -108,6 +113,126 @@ pub unsafe fn ctlcolor(msg: u32, wparam: WPARAM) -> Option<LRESULT> {
         cached_brush(&BG_BRUSH, BG)
     };
     Some(LRESULT(brush.0 as isize))
+}
+
+/// Style tambahan combobox agar bisa digambar gelap. Combobox `CBS_DROPDOWNLIST`
+/// TAK mengirim `WM_CTLCOLOR*` untuk permukaannya (kotak selection) → tetap putih
+/// walau anak sudah `DarkMode_Explorer`. Owner-draw membuat kita menggambarnya
+/// sendiri. Kembalikan 0 saat tema terang (combobox normal, tanpa owner-draw).
+///
+/// Pakai saat MEMBUAT combobox: `... | dark::combo_style() ...`, lalu route
+/// `WM_DRAWITEM` ke [`draw_combobox`].
+pub fn combo_style() -> u32 {
+    if is_dark() {
+        (CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32
+    } else {
+        0
+    }
+}
+
+/// Gambar permukaan + item combobox owner-draw secara gelap. Panggil dari
+/// `WM_DRAWITEM`. Kembalikan `Some(LRESULT(1))` bila ditangani (dark + combobox),
+/// `None` bila bukan (biar proc pakai default).
+///
+/// # Safety
+/// `lparam` harus pointer `DRAWITEMSTRUCT` valid dari pesan `WM_DRAWITEM`.
+pub unsafe fn draw_combobox(lparam: LPARAM) -> Option<LRESULT> {
+    if !is_dark() || lparam.0 == 0 {
+        return None;
+    }
+    let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+    if dis.CtlType != ODT_COMBOBOX {
+        return None;
+    }
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+    // Item di dropdown yang tersorot → latar sorotan; selain itu latar field.
+    let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
+    let bg = if selected { SEL_BG } else { EDIT_BG };
+    let brush = CreateSolidBrush(rgb(bg));
+    FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(brush.into());
+    // itemID == -1 → combobox kosong (belum ada pilihan): cukup latar.
+    if dis.itemID as i32 >= 0 {
+        let mut buf = [0u16; 256];
+        SendMessageW(
+            dis.hwndItem,
+            CB_GETLBTEXT,
+            Some(WPARAM(dis.itemID as usize)),
+            Some(LPARAM(buf.as_mut_ptr() as isize)),
+        );
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let mut wide: Vec<u16> = buf[..len].to_vec();
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(TEXT));
+        let mut tr = RECT { left: rc.left + 5, ..rc };
+        DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    Some(LRESULT(1))
+}
+
+// ID subclass combobox (unik terhadap header subclass).
+const COMBO_SUBCLASS_ID: usize = 0x00AD_0002;
+
+/// Subclass combobox agar tombol dropdown ▾ digambar gelap (theme bawaan
+/// membiarkannya putih). Aman dipanggil berulang. Dipasang otomatis via
+/// [`apply`] untuk tiap combobox anak.
+///
+/// # Safety
+/// `combo` harus handle combobox (`ComboBox`) valid.
+pub unsafe fn install_combo(combo: HWND) {
+    let _ = SetWindowSubclass(combo, Some(combo_subclass), COMBO_SUBCLASS_ID, 0);
+}
+
+unsafe extern "system" fn combo_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    if msg == WM_PAINT && is_dark() {
+        // Biarkan combobox menggambar normal (permukaan → WM_DRAWITEM gelap,
+        // tombol → theme putih), lalu timpa tombolnya gelap.
+        let ret = DefSubclassProc(hwnd, msg, wparam, lparam);
+        paint_combo_button(hwnd);
+        return ret;
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// Overpaint tombol dropdown combobox: kotak gelap + chevron ▾ terang.
+unsafe fn paint_combo_button(hwnd: HWND) {
+    let hdc = GetDC(Some(hwnd));
+    if hdc.0.is_null() {
+        return;
+    }
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let bw = GetSystemMetrics(SM_CXVSCROLL).max(16);
+    let btn = RECT { left: rc.right - bw, top: rc.top, right: rc.right, bottom: rc.bottom };
+    let fill = CreateSolidBrush(rgb(EDIT_BG));
+    FillRect(hdc, &btn, fill);
+    let _ = DeleteObject(fill.into());
+    // Chevron bawah (segitiga) di tengah tombol.
+    let cx = (btn.left + btn.right) / 2;
+    let cy = (btn.top + btn.bottom) / 2;
+    let pts = [
+        POINT { x: cx - 4, y: cy - 2 },
+        POINT { x: cx + 4, y: cy - 2 },
+        POINT { x: cx, y: cy + 3 },
+    ];
+    let brush = CreateSolidBrush(rgb(TEXT));
+    let pen = CreatePen(PS_SOLID, 1, rgb(TEXT));
+    let ob = SelectObject(hdc, brush.into());
+    let op = SelectObject(hdc, pen.into());
+    let _ = Polygon(hdc, &pts);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteObject(pen.into());
+    ReleaseDC(Some(hwnd), hdc);
 }
 
 /// Isi latar dialog dengan warna gelap saat `WM_ERASEBKGND`. Kembalikan
@@ -170,7 +295,29 @@ unsafe fn header_customdraw(lparam: LPARAM) -> Option<LRESULT> {
     let cd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
     let stage = cd.dwDrawStage;
     if stage == CDDS_PREPAINT {
-        return Some(LRESULT(CDRF_NOTIFYITEMDRAW as isize));
+        // Minta notifikasi per-item + POSTPAINT. Latar diisi di POSTPAINT (di
+        // PREPAINT akan tertimpa cat default header → area kosong tetap putih).
+        return Some(LRESULT((CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize));
+    }
+    if stage == CDDS_POSTPAINT {
+        // Isi area kosong di kanan kolom terakhir (di luar semua item) dgn warna
+        // header → tak tertinggal putih. Cari tepi kanan terjauh dari item.
+        let hdr = cd.hdr.hwndFrom;
+        let count = SendMessageW(hdr, HDM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as i32;
+        let mut max_right = 0i32;
+        for i in 0..count {
+            let mut ir = RECT::default();
+            SendMessageW(hdr, HDM_GETITEMRECT, Some(WPARAM(i as usize)),
+                Some(LPARAM(&mut ir as *mut _ as isize)));
+            max_right = max_right.max(ir.right);
+        }
+        if max_right < cd.rc.right {
+            let filler = RECT { left: max_right, top: cd.rc.top, right: cd.rc.right, bottom: cd.rc.bottom };
+            let bg = CreateSolidBrush(rgb(HEADER_BG));
+            FillRect(cd.hdc, &filler, bg);
+            let _ = DeleteObject(bg.into());
+        }
+        return Some(LRESULT(CDRF_DODEFAULT as isize));
     }
     if stage != CDDS_ITEMPREPAINT {
         return Some(LRESULT(CDRF_DODEFAULT as isize));

@@ -2639,6 +2639,19 @@ unsafe fn build_disabled_imagelist() -> HIMAGELIST {
 /// Terapkan tema aktif (plan §12): title bar gelap, warna ListView/TreeView,
 /// dan ikon toolbar sesuai tema. Chrome klasik (menu/toolbar/status) tetap
 /// warna sistem (keterbatasan Win32 tanpa owner-draw penuh).
+/// Aktif/nonaktifkan border sunken (`WS_EX_CLIENTEDGE`). Di tema gelap border
+/// sunken digambar window manager dgn garis terang di tepi bawah/kanan (tak
+/// tersentuh DarkMode_Explorer) → tampak sbg "garis persinggungan" putih. Flat
+/// saat gelap, sunken klasik saat terang.
+unsafe fn set_client_edge(h: HWND, on: bool) {
+    let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+    let ex2 = if on { ex | WS_EX_CLIENTEDGE.0 } else { ex & !WS_EX_CLIENTEDGE.0 };
+    if ex2 != ex {
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex2 as isize);
+        let _ = SetWindowPos(h, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+}
+
 unsafe fn apply_theme(hwnd: HWND) {
     let dark = crate::theme::effective_dark(crate::settings::get().theme);
     DARK.store(dark, Ordering::SeqCst);
@@ -2663,6 +2676,7 @@ unsafe fn apply_theme(hwnd: HWND) {
     let sub = if dark { w!("DarkMode_Explorer") } else { w!("Explorer") };
 
     if let Some(lv) = state::load_hwnd(&state::LIST_HWND) {
+        set_client_edge(lv, !dark);
         let _ = SetWindowTheme(lv, sub, PCWSTR::null());
         SendMessageW(lv, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
         SendMessageW(lv, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
@@ -2673,6 +2687,7 @@ unsafe fn apply_theme(hwnd: HWND) {
         let _ = InvalidateRect(Some(lv), None, true);
     }
     if let Some(tv) = state::load_hwnd(&state::TREE_HWND) {
+        set_client_edge(tv, !dark);
         let _ = SetWindowTheme(tv, sub, PCWSTR::null());
         SendMessageW(tv, TVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
         SendMessageW(tv, TVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt.0 as isize)));

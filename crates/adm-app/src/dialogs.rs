@@ -228,7 +228,7 @@ fn dialog_impl(
         let _ = make_child(dlg, w!("STATIC"), w!("Category:"), WINDOW_STYLE(0), 16, 56, 60, 18, 0, instance);
         let combo = make_child(
             dlg, w!("COMBOBOX"), PCWSTR::null(),
-            WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
+            WINDOW_STYLE(WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()),
             84, 54, 200, 200, 101, instance,
         );
         for c in ["General", "Compressed", "Documents", "Music", "Programs", "Video"] {
@@ -421,6 +421,12 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 DONE.store(true, Ordering::SeqCst);
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
+            }
+            WM_DRAWITEM => {
+                if let Some(r) = crate::dark::draw_combobox(lparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
                 if let Some(r) = crate::dark::ctlcolor(msg, wparam) {

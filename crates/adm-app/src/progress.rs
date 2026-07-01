@@ -292,7 +292,7 @@ pub fn open(parent: HWND, id: u64) {
         t3.push(label(dlg, "When done:", 20, 138, 80));
         let combo = mk(
             dlg, w!("COMBOBOX"), PCWSTR::null(),
-            WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
+            WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()),
             110, 136, 160, 200, 0,
         );
         for o in ["Shut down", "Hibernate", "Sleep", "Exit"] {
@@ -464,6 +464,12 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     }
                 }
                 LRESULT(0)
+            }
+            WM_DRAWITEM => {
+                if let Some(r) = crate::dark::draw_combobox(lparam) {
+                    return r;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
                 if let Some(r) = crate::dark::ctlcolor(msg, wparam) {
