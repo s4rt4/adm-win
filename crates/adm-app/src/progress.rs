@@ -23,11 +23,75 @@ const IDC_CANCEL: usize = 2;
 const IDC_HIDE: usize = 3;
 const IDC_SL_CHECK: usize = 10;
 const IDC_SL_EDIT: usize = 11;
+const IDC_OC_DLG: usize = 12; // Show download complete dialog
+const IDC_OC_EXIT: usize = 13; // Exit ADM when done
+const IDC_OC_POWER: usize = 14; // Turn off computer when done
+const IDC_OC_COMBO: usize = 15; // When done: (Shut down/Hibernate/Sleep/Exit)
 const TIMER_ID: usize = 1;
 const ANIM_TIMER: usize = 2;
 
 /// Registry dialog progres terbuka (id → HWND) untuk auto-tutup saat selesai.
 static OPEN_DIALOGS: Mutex<Vec<(u64, isize)>> = Mutex::new(Vec::new());
+
+/// Aksi combo "When done" pada tab Options on completion.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum WhenDone {
+    #[default]
+    Shutdown,
+    Hibernate,
+    Sleep,
+    Exit,
+}
+
+impl WhenDone {
+    fn from_index(i: usize) -> Self {
+        match i {
+            1 => WhenDone::Hibernate,
+            2 => WhenDone::Sleep,
+            3 => WhenDone::Exit,
+            _ => WhenDone::Shutdown,
+        }
+    }
+}
+
+/// Opsi per-unduhan dari tab "Options on completion". Dibaca `gui` saat unduhan
+/// selesai untuk menampilkan dialog/keluar/mematikan komputer.
+#[derive(Clone, Copy, Default)]
+pub struct CompletionOpts {
+    pub show_dialog: bool,
+    pub exit_app: bool,
+    pub power: bool,
+    pub when_done: WhenDone,
+}
+
+impl CompletionOpts {
+    /// Ada aksi non-default yang perlu dikerjakan?
+    fn is_empty(&self) -> bool {
+        !self.show_dialog && !self.exit_app && !self.power
+    }
+}
+
+/// Opsi penyelesaian per-unduhan (id → opsi); diisi saat kontrol tab di-toggle,
+/// dikonsumsi (`take`) `gui` saat unduhan selesai.
+static COMPLETION_OPTS: Mutex<Vec<(u64, CompletionOpts)>> = Mutex::new(Vec::new());
+
+/// Ambil & hapus opsi penyelesaian untuk `id` (dipanggil saat unduhan selesai).
+pub fn take_completion_opts(id: u64) -> Option<CompletionOpts> {
+    let mut m = COMPLETION_OPTS.lock().unwrap();
+    if let Some(pos) = m.iter().position(|(i, _)| *i == id) {
+        Some(m.swap_remove(pos).1)
+    } else {
+        None
+    }
+}
+
+fn set_completion_opts(id: u64, opts: CompletionOpts) {
+    let mut m = COMPLETION_OPTS.lock().unwrap();
+    m.retain(|(i, _)| *i != id);
+    if !opts.is_empty() {
+        m.push((id, opts));
+    }
+}
 
 /// Tutup dialog progres untuk unduhan `id` (dipanggil saat selesai).
 pub fn close_for(id: u64) {
@@ -65,6 +129,10 @@ struct DlgData {
     tabs: [Vec<HWND>; 3],
     chk_limit: HWND,
     edit_limit: HWND,
+    chk_oc_dlg: HWND,
+    chk_oc_exit: HWND,
+    chk_oc_power: HWND,
+    combo_when: HWND,
     details: bool,
 }
 
@@ -284,16 +352,19 @@ pub fn open(parent: HWND, id: u64) {
             let _ = ShowWindow(*h, SW_HIDE);
         }
 
-        // ---- Tab 3: Options on completion (kosmetik untuk WM4) ----
+        // ---- Tab 3: Options on completion ----
         let mut t3 = Vec::new();
-        t3.push(mk(dlg, w!("BUTTON"), w!("Show download complete dialog"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 50, 280, 20, 0));
-        t3.push(mk(dlg, w!("BUTTON"), w!("Exit ADM when done"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 78, 280, 20, 0));
-        t3.push(mk(dlg, w!("BUTTON"), w!("Turn off computer when done"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 106, 280, 20, 0));
+        let chk_oc_dlg = mk(dlg, w!("BUTTON"), w!("Show download complete dialog"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 50, 280, 20, IDC_OC_DLG);
+        t3.push(chk_oc_dlg);
+        let chk_oc_exit = mk(dlg, w!("BUTTON"), w!("Exit ADM when done"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 78, 280, 20, IDC_OC_EXIT);
+        t3.push(chk_oc_exit);
+        let chk_oc_power = mk(dlg, w!("BUTTON"), w!("Turn off computer when done"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 106, 280, 20, IDC_OC_POWER);
+        t3.push(chk_oc_power);
         t3.push(label(dlg, "When done:", 20, 138, 80));
         let combo = mk(
             dlg, w!("COMBOBOX"), PCWSTR::null(),
             WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | crate::dark::combo_style()),
-            110, 136, 160, 200, 0,
+            110, 136, 160, 200, IDC_OC_COMBO,
         );
         for o in ["Shut down", "Hibernate", "Sleep", "Exit"] {
             let h = HSTRING::from(o);
@@ -329,6 +400,10 @@ pub fn open(parent: HWND, id: u64) {
             tabs: [t1, t2, t3],
             chk_limit,
             edit_limit,
+            chk_oc_dlg,
+            chk_oc_exit,
+            chk_oc_power,
+            combo_when: combo,
             details: true,
         });
         SetWindowLongPtrW(dlg, GWLP_USERDATA, Box::into_raw(data) as isize);
@@ -493,7 +568,15 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     let did = d.id;
                     match id {
                         IDC_SL_CHECK => apply_limit(hwnd),
-                        IDC_SL_EDIT if code == EN_KILLFOCUS as usize => apply_limit(hwnd),
+                        IDC_SL_EDIT
+                            if code == EN_CHANGE as usize || code == EN_KILLFOCUS as usize =>
+                        {
+                            apply_limit(hwnd)
+                        }
+                        IDC_OC_DLG | IDC_OC_EXIT | IDC_OC_POWER => store_completion_opts(hwnd),
+                        IDC_OC_COMBO if code == CBN_SELCHANGE as usize => {
+                            store_completion_opts(hwnd)
+                        }
                         IDC_PAUSE => {
                             if let Some(e) = crate::gui::engine() {
                                 if let Some(r) = store::get(did) {
@@ -546,6 +629,20 @@ unsafe fn apply_limit(hwnd: HWND) {
     if let Some(e) = crate::gui::engine() {
         e.set_limit(d.id, bps);
     }
+}
+
+/// Baca kontrol tab "Options on completion" dan simpan opsinya untuk unduhan ini.
+unsafe fn store_completion_opts(hwnd: HWND) {
+    let Some(d) = data_of(hwnd) else { return };
+    let checked = |h: HWND| SendMessageW(h, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
+    let sel = SendMessageW(d.combo_when, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    let opts = CompletionOpts {
+        show_dialog: checked(d.chk_oc_dlg),
+        exit_app: checked(d.chk_oc_exit),
+        power: checked(d.chk_oc_power),
+        when_done: WhenDone::from_index(if sel < 0 { 0 } else { sel as usize }),
+    };
+    set_completion_opts(d.id, opts);
 }
 
 unsafe fn read_uint(hwnd: HWND) -> u64 {
@@ -757,8 +854,8 @@ const IDC_DONTSHOW: usize = 5;
 
 /// Dialog modal "Download complete" (§9.14): Open / Open with… / Open folder /
 /// Close + "Don't show this dialog again". Close hanya menutup (tak membuka file).
-/// Disimpan untuk opsi masa depan; kini notifikasi selesai pakai balon tray.
-#[allow(dead_code)]
+/// Ditampilkan saat unduhan selesai bila opsi "Show download complete dialog"
+/// (tab Options on completion) dicentang; jika tidak, notifikasi pakai balon tray.
 pub fn show_complete(parent: HWND, row: &Row) {
     unsafe {
         let instance: HINSTANCE = match GetModuleHandleW(None) {

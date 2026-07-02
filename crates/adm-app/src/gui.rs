@@ -2005,6 +2005,10 @@ unsafe fn refresh_ui(hwnd: HWND) {
     // satu lapis yang menampilkan popup, dan menguras semua secara berurutan.
     if !IN_POPUP.swap(true, Ordering::SeqCst) {
         let show_complete = crate::settings::get().show_complete_dialog;
+        // Aksi penyelesaian per-unduhan (tab "Options on completion") dikumpulkan
+        // dulu, dikerjakan setelah semua notifikasi selesai.
+        let mut do_exit = false;
+        let mut power: Option<crate::progress::WhenDone> = None;
         loop {
             let completed = store::take_newly_completed();
             let failed = store::take_newly_failed();
@@ -2012,10 +2016,23 @@ unsafe fn refresh_ui(hwnd: HWND) {
                 break;
             }
             for row in completed {
+                let opts = crate::progress::take_completion_opts(row.id);
                 crate::progress::close_for(row.id); // unduhan selesai → tutup dialog status
-                if show_complete {
+                // Opsi per-unduhan menang atas setelan global.
+                if opts.map(|o| o.show_dialog).unwrap_or(false) {
+                    // Dialog modal "Download complete" (Open / Open folder / …).
+                    crate::progress::show_complete(hwnd, &row);
+                } else if show_complete {
                     // Toast non-modal (bukan dialog modal yang menyela).
                     notify_balloon(hwnd, "Download selesai", &row.filename());
+                }
+                if let Some(o) = opts {
+                    if o.exit_app {
+                        do_exit = true;
+                    }
+                    if o.power {
+                        power = Some(o.when_done);
+                    }
                 }
             }
             for row in failed {
@@ -2024,6 +2041,21 @@ unsafe fn refresh_ui(hwnd: HWND) {
             }
         }
         IN_POPUP.store(false, Ordering::SeqCst);
+
+        // "Turn off computer when done" (menang) lalu "Exit ADM when done".
+        // Combo "Exit" diperlakukan sama dengan keluar aplikasi.
+        if let Some(w) = power {
+            match w {
+                crate::progress::WhenDone::Exit => do_exit = true,
+                other => on_completion_power(other),
+            }
+        }
+        if do_exit {
+            // Keluar sungguhan (WM_CLOSE hanya sembunyi ke tray). DestroyWindow →
+            // WM_DESTROY (flush store + PostQuitMessage). Tanpa prompt: ini
+            // otomatisasi yang dipilih pengguna, jangan halangi shutdown tanpa awak.
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }
 
@@ -2807,5 +2839,65 @@ fn remove_tray_icon(hwnd: HWND) {
     };
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+/// Aktifkan privilege SE_SHUTDOWN untuk proses ini (wajib untuk shutdown maupun
+/// hibernate/sleep). Diabaikan bila gagal — aksi power lalu tak berefek.
+unsafe fn enable_shutdown_privilege() {
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+        SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    if OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut token,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let mut luid = LUID::default();
+    if LookupPrivilegeValueW(PCWSTR::null(), SE_SHUTDOWN_NAME, &mut luid).is_ok() {
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let _ = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+    }
+    let _ = CloseHandle(token);
+}
+
+/// Kerjakan aksi power tab "Options on completion" (Shut down/Hibernate/Sleep).
+/// `Exit` ditangani pemanggil sebagai keluar aplikasi biasa.
+fn on_completion_power(action: crate::progress::WhenDone) {
+    use crate::progress::WhenDone;
+    use windows::Win32::System::Power::SetSuspendState;
+    use windows::Win32::System::Shutdown::{
+        ExitWindowsEx, EWX_FORCEIFHUNG, EWX_SHUTDOWN, SHUTDOWN_REASON,
+    };
+
+    unsafe {
+        enable_shutdown_privilege();
+        match action {
+            WhenDone::Shutdown => {
+                let _ = ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCEIFHUNG, SHUTDOWN_REASON(0));
+            }
+            // args: bhibernate, bforce, bwakeupeventsdisabled
+            WhenDone::Hibernate => {
+                let _ = SetSuspendState(true, false, false);
+            }
+            WhenDone::Sleep => {
+                let _ = SetSuspendState(false, false, false);
+            }
+            WhenDone::Exit => {}
+        }
     }
 }
