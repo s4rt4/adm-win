@@ -24,6 +24,8 @@ static ENGINE: OnceLock<EngineHandle> = OnceLock::new();
 static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// HMENU submenu Theme (untuk radio-check).
 static THEME_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// HMENU submenu Speed Limiter global (untuk radio-check preset aktif).
+static LIMIT_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Label "empty state" yang tampil saat daftar kosong (di atas ListView).
 static EMPTY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Kolom sort aktif (-1 = urutan store) + arah naik.
@@ -722,7 +724,9 @@ unsafe fn build_menus() {
     append(sl, ID_SL_500, w!("500 KB/s"));
     append(sl, ID_SL_1M, w!("1 MB/s"));
     append(sl, ID_SL_5M, w!("5 MB/s"));
+    LIMIT_MENU.store(sl.0 as isize, Ordering::SeqCst);
     popup(dl, sl, w!("Speed Limiter"));
+    update_limit_checks(); // tandai preset aktif dari settings (persist antar-restart)
     sep(dl);
     append(dl, ID_OPTIONS, w!("Options..."));
 
@@ -1320,7 +1324,10 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_EXIT => request_exit(hwnd),
         // Fitur milestone lain.
         ID_SCHEDULER => crate::scheduler::show(hwnd),
-        ID_OPTIONS => crate::options::show(hwnd),
+        ID_OPTIONS => {
+            crate::options::show(hwnd); // modal; bisa mengubah limit global
+            update_limit_checks(); // selaraskan centang preset dgn nilai baru
+        }
         ID_SL_UNLIM => set_global_limit(0),
         ID_SL_50 => set_global_limit(50 * 1024),
         ID_SL_100 => set_global_limit(100 * 1024),
@@ -2143,6 +2150,39 @@ fn set_status_bar(text: &str) {
 fn set_global_limit(bps: u64) {
     if let Some(e) = ENGINE.get() {
         e.set_global_limit(bps);
+    }
+    // Persist (KB/s) agar bertahan setelah restart — diterapkan lagi di lib.rs
+    // saat startup. Lalu segarkan tanda centang preset aktif di menu.
+    crate::settings::update(|s| s.global_limit_kbps = bps / 1024);
+    unsafe { update_limit_checks() };
+}
+
+/// Tandai preset Speed Limiter global yang aktif (radio) sesuai settings.
+/// Nilai custom (mis. diketik di Options) → tak ada preset cocok, lepas centang.
+unsafe fn update_limit_checks() {
+    let h = LIMIT_MENU.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    let menu = HMENU(h as *mut core::ffi::c_void);
+    let sel = match crate::settings::get().global_limit_kbps {
+        0 => Some(ID_SL_UNLIM),
+        50 => Some(ID_SL_50),
+        100 => Some(ID_SL_100),
+        500 => Some(ID_SL_500),
+        1024 => Some(ID_SL_1M),
+        5120 => Some(ID_SL_5M),
+        _ => None,
+    };
+    match sel {
+        Some(id) => {
+            let _ = CheckMenuRadioItem(menu, ID_SL_UNLIM as u32, ID_SL_5M as u32, id as u32, MF_BYCOMMAND.0);
+        }
+        None => {
+            for id in [ID_SL_UNLIM, ID_SL_50, ID_SL_100, ID_SL_500, ID_SL_1M, ID_SL_5M] {
+                let _ = CheckMenuItem(menu, id as u32, (MF_BYCOMMAND | MF_UNCHECKED).0);
+            }
+        }
     }
 }
 
