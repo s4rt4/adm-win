@@ -137,7 +137,16 @@ async fn verify_prefix(client: &Client, url: &str, output: &std::path::Path, len
     use std::io::Read;
     let range = format!("bytes=0-{}", len - 1);
     let resp = client.get(url).header(RANGE, range).send().await.ok()?.error_for_status().ok()?;
-    let body = resp.bytes().await.ok()?;
+    // Baca streaming maksimal `len` byte: server yang mengabaikan Range membalas
+    // 200 dengan body PENUH — jangan tarik file multi-GB ke RAM.
+    let mut body: Vec<u8> = Vec::with_capacity(len as usize);
+    let mut stream = resp.bytes_stream();
+    while (body.len() as u64) < len {
+        let Some(item) = stream.next().await else { break };
+        let chunk = item.ok()?;
+        let room = len as usize - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
     let n = (len as usize).min(body.len());
     if n == 0 {
         return None;
@@ -145,7 +154,13 @@ async fn verify_prefix(client: &Client, url: &str, output: &std::path::Path, len
     let mut disk = vec![0u8; n];
     let mut f = std::fs::File::open(output).ok()?;
     f.read_exact(&mut disk).ok()?;
-    Some(disk.as_slice() == &body[..n])
+    if disk.as_slice() != &body[..n] {
+        return Some(false); // jelas beda — meski perbandingan parsial
+    }
+    if n < len as usize {
+        return None; // cocok tapi datanya kurang: belum bisa dipastikan
+    }
+    Some(true)
 }
 
 /// Probe ringan satu URL (client default tanpa header titipan).
@@ -188,15 +203,26 @@ pub async fn download(
 
     // Jalur non-resumable: ukuran tak diketahui atau Range tak didukung.
     if !pr.resumable {
+        // Sidecar lama (dari percobaan resumable sebelumnya) jadi basi begitu
+        // file ditulis ulang dari nol — buang agar resume berikutnya tak korup.
+        sidecar::remove(&sidecar_path);
         return download_single(&client, &req, cancel, on_progress, pr.total, per_limiter, global_limiter).await;
     }
 
     let total = pr.total.ok_or(Error::UnknownSize)?;
     let conns = req.connections.clamp(1, 64);
 
-    // Resume bila sidecar cocok; selain itu rencana segar.
+    // Resume bila sidecar cocok; selain itu rencana segar. Sidecar hanya
+    // dipercaya bila (a) file output masih ada dengan ukuran pre-alokasi penuh
+    // — state kini terpisah dari file, jadi file bisa dihapus user tanpa state
+    // ikut hilang; resume buta = file penuh nol dilaporkan Completed — dan
+    // (b) rekaman segmennya utuh menutup [0, total) tanpa celah/tumpang-tindih.
+    let output_len = std::fs::metadata(&req.output).map(|m| m.len()).unwrap_or(0);
     let loaded = sidecar::load(&sidecar_path);
-    let reuse = loaded.as_ref().is_some_and(|sc| sc.is_compatible(&req.url, &pr));
+    let reuse = output_len == total
+        && loaded
+            .as_ref()
+            .is_some_and(|sc| sc.is_compatible(&req.url, &pr) && sc.segments_valid(total));
     let url_changed = loaded.as_ref().is_some_and(|sc| sc.url != req.url);
     let mut segments: Vec<Arc<SegState>> = if reuse {
         loaded
@@ -316,7 +342,12 @@ pub async fn download(
 
 /// Segmentasi statis: bagi `total` ke `conns` rentang kontigu hampir sama.
 fn plan_segments(total: u64, conns: usize) -> Vec<Arc<SegState>> {
-    let conns = conns.max(1) as u64;
+    if total == 0 {
+        return Vec::new(); // file kosong: tanpa segmen (langsung complete)
+    }
+    // ≥1 byte per segmen: file lebih kecil dari jumlah koneksi membuat
+    // base = 0 dan `start + base - 1` underflow.
+    let conns = (conns.max(1) as u64).min(total);
     let base = total / conns;
     let mut segs = Vec::new();
     let mut start = 0u64;
@@ -454,6 +485,17 @@ async fn download_single(
         }
     }
     file.flush()?;
+    // Body chunked yang diterminasi rapi sebelum tuntas tidak dianggap error
+    // oleh hyper — bandingkan dengan total probe agar file terpotong tidak
+    // dilaporkan Completed. (downloaded > total dibiarkan: body ter-decode
+    // transfer/content-encoding bisa lebih besar dari Content-Length.)
+    if let Some(t) = total {
+        if downloaded < t {
+            return Err(Error::Other(format!(
+                "body terputus: {downloaded} dari {t} byte"
+            )));
+        }
+    }
     Ok(Outcome::Completed { bytes: downloaded })
 }
 

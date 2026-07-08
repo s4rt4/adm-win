@@ -25,6 +25,76 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// `CREATE_NO_WINDOW` — jalankan yt-dlp tanpa jendela konsol berkedip.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+// ============================ Job object (anti-yatim) ============================
+
+/// Job object `KILL_ON_JOB_CLOSE` per proses yt-dlp: seluruh pohon proses
+/// (yt-dlp + ffmpeg anaknya) mati bersama saat di-`terminate` (Stop) ATAU saat
+/// handle tertutup — termasuk saat ADM keluar mendadak. Tanpa ini, `kill()`
+/// hanya mematikan yt-dlp (ffmpeg yatim terus menulis & mengunci file), dan
+/// keluar dari ADM meninggalkan unduhan yt-dlp berjalan tanpa UI.
+pub(crate) struct KillTree(HANDLE);
+
+// HANDLE job object aman dibagikan antar-thread (Terminate/Close thread-safe).
+unsafe impl Send for KillTree {}
+unsafe impl Sync for KillTree {}
+
+impl KillTree {
+    pub(crate) fn new() -> Option<Self> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        unsafe {
+            let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            Some(KillTree(job))
+        }
+    }
+
+    /// Masukkan proses anak ke job (anak-anaknya otomatis ikut).
+    pub(crate) fn assign(&self, child: &std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+        unsafe {
+            let _ = AssignProcessToJobObject(self.0, HANDLE(child.as_raw_handle()));
+        }
+    }
+
+    /// Bunuh seluruh pohon proses dalam job.
+    pub(crate) fn terminate(&self) {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+        unsafe {
+            let _ = TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+impl Drop for KillTree {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Jalankan `cmd` sampai selesai dengan proses terdaftar di job object —
+/// pengganti `Command::output()` agar probe/fetch tak yatim saat ADM keluar.
+fn output_with_job(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    let child = cmd.spawn()?;
+    let tree = KillTree::new();
+    if let Some(t) = &tree {
+        t.assign(&child);
+    }
+    child.wait_with_output()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Video + audio (digabung ffmpeg).
@@ -156,7 +226,11 @@ fn format_args(req: &YtRequest) -> Vec<String> {
 fn common_args(req: &YtRequest, dir: &std::path::Path) -> Vec<String> {
     let mut a = format_args(req);
     a.push("-o".into());
-    a.push(dir.join("%(title)s.%(ext)s").to_string_lossy().into_owned());
+    // yt-dlp menafsirkan `%` di path sebagai field template → escape jadi `%%`
+    // (folder unduhan seperti `D:\100%stuff` merusak template tanpa ini).
+    let dir_esc = dir.to_string_lossy().replace('%', "%%");
+    let dir_esc = dir_esc.trim_end_matches(['\\', '/']);
+    a.push(format!("{dir_esc}\\%(title)s.%(ext)s"));
     a.push(if req.mode == Mode::Playlist {
         "--yes-playlist".into()
     } else {
@@ -176,13 +250,41 @@ fn hint_name(mode: Mode) -> String {
     }
 }
 
+/// Tag mode untuk dipersist di store (Resume perlu tahu cara me-restart).
+pub fn mode_tag(m: Mode) -> &'static str {
+    match m {
+        Mode::Video => "video",
+        Mode::AudioOnly => "audio",
+        Mode::VideoOnly => "video_only",
+        Mode::Playlist => "playlist",
+    }
+}
+
+pub fn mode_from_tag(s: &str) -> Option<Mode> {
+    Some(match s {
+        "video" => Mode::Video,
+        "audio" => Mode::AudioOnly,
+        "video_only" => Mode::VideoOnly,
+        "playlist" => Mode::Playlist,
+        _ => return None,
+    })
+}
+
 /// Mulai unduhan YouTube; kembalikan id baris (untuk buka dialog progres).
 /// Mengembalikan `None` bila biner tak tersedia.
 pub fn start(engine: &EngineHandle, req: YtRequest) -> Option<u64> {
+    let id = engine.alloc_id();
+    start_as(engine, id, req)
+}
+
+/// Mulai/lanjutkan unduhan YouTube memakai id baris yang SUDAH ada — dipakai
+/// Resume/Redownload agar baris YouTube di-restart lewat yt-dlp, bukan engine
+/// HTTP (yang hanya akan mengunduh HTML halaman watch). yt-dlp sendiri
+/// meneruskan file `.part` yang ada (perilaku continue default).
+pub fn start_as(engine: &EngineHandle, id: u64, req: YtRequest) -> Option<u64> {
     let ytdlp = ytdlp_path()?;
     let ffmpeg = ffmpeg_path()?;
     let dir = engine.download_dir();
-    let id = engine.alloc_id();
     let token = engine.register(id);
     // Baris instan dengan nama placeholder (dikoreksi saat judul asli diketahui).
     engine.emit(EngineEvent::Started {
@@ -190,10 +292,20 @@ pub fn start(engine: &EngineHandle, req: YtRequest) -> Option<u64> {
         url: req.url.clone(),
         output: dir.join(hint_name(req.mode)),
     });
+    // Baris sudah ada di store (sink Started sinkron) → tandai sbg YouTube.
+    if req.mode != Mode::Playlist {
+        crate::store::set_youtube(id, mode_tag(req.mode).to_string(), req.height);
+    }
     let eng = engine.clone();
-    let _ = std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name(format!("ytdlp-{id}"))
-        .spawn(move || run_job(eng, id, token, ytdlp, ffmpeg, dir, req));
+        .spawn(move || run_job(eng, id, token, ytdlp, ffmpeg, dir, req))
+        .is_err()
+    {
+        // Tanpa worker, baris akan macet "Downloading" selamanya.
+        engine.unregister(id);
+        engine.emit(EngineEvent::Failed { id, error: "Gagal memulai thread yt-dlp".into() });
+    }
     Some(id)
 }
 
@@ -231,10 +343,11 @@ fn probe_filename(ytdlp: &std::path::Path, req: &YtRequest, dir: &std::path::Pat
     let mut cmd = Command::new(ytdlp);
     cmd.args(common_args(req, dir));
     cmd.args(["--print", "filename", "--no-download", "--no-warnings", "--quiet"]);
+    cmd.arg("--"); // akhir opsi: URL/ID yang diawali '-' tak boleh diparse sbg flag
     cmd.arg(&req.url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     tool_env(&mut cmd, ytdlp);
-    let out = cmd.output().ok()?;
+    let out = output_with_job(cmd).ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(PathBuf::from(line))
@@ -264,6 +377,7 @@ pub(crate) fn build_dl_command(
         "download:ADMPROG %(progress.downloaded_bytes)s %(progress.total_bytes)s \
          %(progress.total_bytes_estimate)s %(progress.speed)s",
     );
+    cmd.arg("--"); // akhir opsi: URL/ID yang diawali '-' tak boleh diparse sbg flag
     cmd.arg(&req.url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     tool_env(&mut cmd, ytdlp);
@@ -305,6 +419,12 @@ pub(crate) fn stream_ytdlp(
     let mut child = spawned;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // Satu job per unduhan: Stop membunuh seluruh pohon (yt-dlp + ffmpeg),
+    // dan keluar dari ADM (handle job tertutup) tak meninggalkan proses yatim.
+    let tree = KillTree::new();
+    if let Some(t) = &tree {
+        t.assign(&child);
+    }
     let child = Mutex::new(child);
 
     let done_flag = AtomicBool::new(false);
@@ -320,6 +440,11 @@ pub(crate) fn stream_ytdlp(
         s.spawn(|| loop {
             if is_cancelled() {
                 killed.store(true, Ordering::SeqCst);
+                // Bunuh SELURUH pohon via job — kill() saja meninggalkan ffmpeg
+                // yatim yang terus mengunci file output.
+                if let Some(t) = &tree {
+                    t.terminate();
+                }
                 let _ = child.lock().unwrap().kill();
                 break;
             }
@@ -455,11 +580,16 @@ fn is_intermediate(path: &str) -> bool {
 /// Parse baris "downloaded total estimate speed" (nilai bisa "NA").
 /// Kembalikan (downloaded, total, speed_bps).
 pub(crate) fn parse_progress(s: &str) -> Option<(u64, Option<u64>, u64)> {
+    // Beberapa extractor melaporkan byte sebagai float ("12345.0") — terima
+    // int maupun float agar progres tak macet di 0.
+    fn num(v: &str) -> Option<u64> {
+        v.parse::<u64>().ok().or_else(|| v.parse::<f64>().ok().map(|f| f as u64))
+    }
     let mut it = s.split_whitespace();
-    let downloaded = it.next()?.parse::<u64>().ok()?;
-    let total = it.next().and_then(|v| v.parse::<u64>().ok());
-    let estimate = it.next().and_then(|v| v.parse::<f64>().ok().map(|f| f as u64));
-    let speed = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
+    let downloaded = num(it.next()?)?;
+    let total = it.next().and_then(num);
+    let estimate = it.next().and_then(num);
+    let speed = it.next().and_then(num).unwrap_or(0);
     Some((downloaded, total.or(estimate).filter(|&t| t > 0), speed))
 }
 
@@ -504,10 +634,11 @@ fn codec_present(c: &Option<String>) -> bool {
 pub fn fetch_video_meta(ytdlp: &std::path::Path, url: &str) -> Result<VideoMeta, String> {
     let mut cmd = Command::new(ytdlp);
     cmd.args(["-J", "--no-playlist", "--no-warnings"]);
+    cmd.arg("--");
     cmd.arg(url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     tool_env(&mut cmd, ytdlp);
-    let out = cmd.output().map_err(|e| format!("Gagal menjalankan yt-dlp: {e}"))?;
+    let out = output_with_job(cmd).map_err(|e| format!("Gagal menjalankan yt-dlp: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp gagal");
@@ -603,10 +734,11 @@ pub struct PlaylistMeta {
 pub fn fetch_playlist(ytdlp: &std::path::Path, url: &str) -> Result<PlaylistMeta, String> {
     let mut cmd = Command::new(ytdlp);
     cmd.args(["-J", "--flat-playlist", "--no-warnings"]);
+    cmd.arg("--");
     cmd.arg(url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     tool_env(&mut cmd, ytdlp);
-    let out = cmd.output().map_err(|e| format!("Gagal menjalankan yt-dlp: {e}"))?;
+    let out = output_with_job(cmd).map_err(|e| format!("Gagal menjalankan yt-dlp: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp gagal");
@@ -886,8 +1018,13 @@ pub fn show_dialog(parent: HWND, initial: Mode) -> Option<YtRequest> {
         let _ = SetForegroundWindow(dlg);
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(u));
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

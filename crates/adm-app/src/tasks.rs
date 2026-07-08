@@ -65,9 +65,22 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     out
 }
 
+/// Batas total hasil ekspansi per baris — juga menahan ledakan KARTESIAN
+/// beberapa pola (`a[1-99999]b[1-99999]` = 10^10 string tanpa batas ini).
+const EXPAND_CAP: usize = 100_000;
+
 /// Ekspansi pola `[start-end]` numerik (mendukung zero-pad: `[01-12]`).
 /// Beberapa pola dalam satu baris diekspansi kartesian. Dibatasi agar aman.
 pub fn expand_pattern(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    expand_into(line, &mut out);
+    out
+}
+
+fn expand_into(line: &str, out: &mut Vec<String>) {
+    if out.len() >= EXPAND_CAP {
+        return; // cap total tercapai — buang sisanya, jangan gantung UI/RAM
+    }
     if let Some(open) = line.find('[') {
         if let Some(close_rel) = line[open..].find(']') {
             let close = open + close_rel;
@@ -76,26 +89,28 @@ pub fn expand_pattern(line: &str) -> Vec<String> {
                 let a = &inner[..dash];
                 let b = &inner[dash + 1..];
                 if let (Ok(start), Ok(end)) = (a.parse::<u64>(), b.parse::<u64>()) {
-                    if start <= end && end - start < 100_000 {
+                    if start <= end && (end - start) < EXPAND_CAP as u64 {
                         let width = a.len();
                         let pad = a.starts_with('0') && width > 1;
                         let (pre, post) = (&line[..open], &line[close + 1..]);
-                        let mut out = Vec::new();
                         for n in start..=end {
+                            if out.len() >= EXPAND_CAP {
+                                return;
+                            }
                             let num = if pad {
                                 format!("{n:0width$}")
                             } else {
                                 n.to_string()
                             };
-                            out.extend(expand_pattern(&format!("{pre}{num}{post}")));
+                            expand_into(&format!("{pre}{num}{post}"), out);
                         }
-                        return out;
+                        return;
                     }
                 }
             }
         }
     }
-    vec![line.to_string()]
+    out.push(line.to_string());
 }
 
 /// Pecah teks batch (per baris) → daftar URL final (wildcard diekspansi).
@@ -254,8 +269,13 @@ pub fn batch_dialog(parent: HWND, initial: &str) -> Option<String> {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -445,8 +465,13 @@ pub fn prompt_dialog(parent: HWND, title: &str, label: &str, initial: &str) -> O
         let _ = SetForegroundWindow(dlg);
         let _ = SetFocus(Some(edit));
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !P_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !P_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -641,8 +666,13 @@ pub fn columns_dialog(parent: HWND, names: &[&str], current: &[bool]) -> Option<
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !C_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !C_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -997,8 +1027,13 @@ pub fn grabber_dialog(parent: HWND) -> Vec<String> {
         let _ = SetForegroundWindow(dlg);
         let _ = SetFocus(Some(url));
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !G_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !G_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

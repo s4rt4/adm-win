@@ -14,6 +14,11 @@ pub enum Category {
 impl Category {
     /// Tentukan kategori dari nama berkas (berdasar ekstensi).
     pub fn from_filename(name: &str) -> Category {
+        if !name.contains('.') {
+            // Tanpa ekstensi: rsplit mengembalikan seluruh nama — file bernama
+            // persis "zip"/"exe" akan salah diklasifikasi.
+            return Category::General;
+        }
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
         match ext.as_str() {
             "zip" | "7z" | "rar" | "gz" | "bz2" | "xz" | "tar" | "tgz" => Category::Compressed,

@@ -143,6 +143,15 @@ where
             "framing tanpa Content-Length",
         )
     })?;
+    // Pipe lokal bisa ditulisi proses lain — jangan percaya Content-Length
+    // mentah (alokasi multi-GB). 4 MB selaras batas bridge native messaging.
+    const MAX_LEN: usize = 4 * 1024 * 1024;
+    if len > MAX_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("pesan terlalu besar: {len} byte"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(Some(buf))

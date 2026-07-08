@@ -1,6 +1,6 @@
 //! State bersama UI <-> engine + pesan kustom untuk marshalling ke UI thread.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -51,4 +51,33 @@ pub fn post_to_ui(msg: u32) {
             let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// Kedalaman dialog modal yang sedang memompa message-loop sendiri.
+/// `refresh_ui` menunda popup completion/failed selama > 0 — popup yang muncul
+/// DI DALAM loop modal dialog lain merusak modality (EnableWindow(parent, true)
+/// tanpa syarat) dan bisa meng-clobber statics dialog.
+static MODAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Guard RAII: naikkan kedalaman modal selama hidup; saat drop, turunkan dan
+/// "senggol" UI (WM_PROGRESS) agar popup yang tertunda segera ditampilkan.
+pub struct ModalGuard;
+
+impl ModalGuard {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        MODAL_DEPTH.fetch_add(1, Ordering::SeqCst);
+        ModalGuard
+    }
+}
+
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        MODAL_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        post_to_ui(WM_PROGRESS);
+    }
+}
+
+pub fn in_modal() -> bool {
+    MODAL_DEPTH.load(Ordering::SeqCst) > 0
 }

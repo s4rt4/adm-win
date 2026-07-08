@@ -275,7 +275,11 @@ fn run_item(mgr: &Arc<Manager>, idx: usize) {
             // Dihapus di tengah jalan → biarkan.
         } else if s.cancelled {
             // Pause/Delete → Stopped (resumable). Delete sudah menandai Removed.
-            it.status = ItemStatus::Stopped;
+            // Bila user keburu me-Resume (status sudah Pending lagi) saat proses
+            // lama masih dimatikan, JANGAN timpa — item harus tetap diproses.
+            if it.status == ItemStatus::Downloading {
+                it.status = ItemStatus::Stopped;
+            }
         } else if s.success {
             it.status = ItemStatus::Done;
             if let Some(p) = &s.final_path {
@@ -321,7 +325,11 @@ fn finalize(mgr: &Arc<Manager>) {
         let active: Vec<&Item> = items.iter().filter(|it| it.status != ItemStatus::Removed).collect();
         let all_done = !active.is_empty() && active.iter().all(|it| it.status == ItemStatus::Done);
         let any_error = active.iter().any(|it| it.status == ItemStatus::Error);
-        let has_pending = active.iter().any(|it| it.status == ItemStatus::Pending);
+        // Item Stopped (user resume sebagian) = masih ada pekerjaan tersisa —
+        // tanpa ini baris agregat keliru dilaporkan Completed.
+        let has_pending = active
+            .iter()
+            .any(|it| matches!(it.status, ItemStatus::Pending | ItemStatus::Stopped));
         let bytes = active.iter().filter_map(|it| it.total).sum::<u64>();
         (all_done, any_error, has_pending, bytes)
     };
@@ -553,8 +561,13 @@ pub fn show_dialog(parent: HWND) -> Option<PlaylistJob> {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !D_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !D_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

@@ -16,7 +16,19 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const CLASS: PCWSTR = w!("AdmOptionsDialog");
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
-static SAVED: AtomicBool = AtomicBool::new(false);
+
+/// Nilai kontrol yang di-capture handler ID_OK SEBELUM `DestroyWindow`.
+/// Membaca kontrol setelah dialog hancur menghasilkan kosong/0 — dulu semua
+/// setelan ke-reset ke default setiap kali OK diklik.
+struct SavedVals {
+    dir: String,
+    queue_max: usize,
+    limit: u64,
+    auto: bool,
+    ytdlp: String,
+    ffmpeg: String,
+}
+static PENDING: Mutex<Option<SavedVals>> = Mutex::new(None);
 
 const ID_DIR: usize = 1;
 const ID_QUEUE: usize = 2;
@@ -97,7 +109,7 @@ pub fn show(parent: HWND) {
             RegisterClassW(&wc);
         }
         DONE.store(false, Ordering::SeqCst);
-        SAVED.store(false, Ordering::SeqCst);
+        *PENDING.lock().unwrap() = None;
 
         let cfg = settings::get();
         let dir = cfg
@@ -183,7 +195,12 @@ pub fn show(parent: HWND) {
         let _ = SetForegroundWindow(dlg);
 
         let mut msg = MSG::default();
-        while !DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        let _modal = crate::state::ModalGuard::new();
+        while !DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -196,13 +213,8 @@ pub fn show(parent: HWND) {
             let _ = DestroyWindow(dlg);
         }
 
-        if SAVED.load(Ordering::SeqCst) {
-            let dir = get_text(ctrl(0)).trim().to_string();
-            let queue_max = get_text(ctrl(1)).trim().parse::<usize>().unwrap_or(1).max(1);
-            let limit = get_text(ctrl(2)).trim().parse::<u64>().unwrap_or(0);
-            let auto = SendMessageW(ctrl(3), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
-            let ytdlp = get_text(ctrl(4)).trim().to_string();
-            let ffmpeg = get_text(ctrl(5)).trim().to_string();
+        if let Some(v) = PENDING.lock().unwrap().take() {
+            let SavedVals { dir, queue_max, limit, auto, ytdlp, ffmpeg } = v;
 
             settings::update(|s| {
                 s.download_dir = if dir.is_empty() { None } else { Some(dir.clone()) };
@@ -231,7 +243,15 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             WM_COMMAND => {
                 match wparam.0 & 0xFFFF {
                     ID_OK => {
-                        SAVED.store(true, Ordering::SeqCst);
+                        // Baca SEMUA nilai kontrol sebelum DestroyWindow.
+                        *PENDING.lock().unwrap() = Some(SavedVals {
+                            dir: get_text(ctrl(0)).trim().to_string(),
+                            queue_max: get_text(ctrl(1)).trim().parse::<usize>().unwrap_or(1).max(1),
+                            limit: get_text(ctrl(2)).trim().parse::<u64>().unwrap_or(0),
+                            auto: SendMessageW(ctrl(3), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1,
+                            ytdlp: get_text(ctrl(4)).trim().to_string(),
+                            ffmpeg: get_text(ctrl(5)).trim().to_string(),
+                        });
                         DONE.store(true, Ordering::SeqCst);
                         let _ = DestroyWindow(hwnd);
                     }

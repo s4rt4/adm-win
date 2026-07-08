@@ -57,16 +57,16 @@ pub fn start(engine: EngineHandle) {
                     continue;
                 }
                 let (dow, now) = local_now();
-                let active = if s.days[dow as usize] {
-                    let start = s.start.0 as u32 * 60 + s.start.1 as u32;
-                    let stop = s.stop.0 as u32 * 60 + s.stop.1 as u32;
-                    if start <= stop {
-                        now >= start && now < stop
-                    } else {
-                        now >= start || now < stop // melewati tengah malam
-                    }
+                let start = s.start.0 as u32 * 60 + s.start.1 as u32;
+                let stop = s.stop.0 as u32 * 60 + s.stop.1 as u32;
+                let active = if start <= stop {
+                    s.days[dow as usize] && now >= start && now < stop
                 } else {
-                    false
+                    // Melewati tengah malam: porsi sebelum `stop` adalah
+                    // kelanjutan jadwal HARI SEBELUMNYA (Senin 22:00–02:00
+                    // harus tetap jalan Selasa 01:00 meski Selasa tak dicentang).
+                    (s.days[dow as usize] && now >= start)
+                        || (s.days[((dow + 6) % 7) as usize] && now < stop)
                 };
                 if active && !was_active {
                     engine.start_queue();
@@ -84,7 +84,8 @@ pub fn start(engine: EngineHandle) {
 const CLASS: PCWSTR = w!("AdmSchedulerDialog");
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
-static SAVED: AtomicBool = AtomicBool::new(false);
+/// Jadwal yang di-capture ID_OK sebelum dialog dihancurkan.
+static PENDING: Mutex<Option<Schedule>> = Mutex::new(None);
 
 const ID_ENABLE: usize = 1;
 const ID_START_H: usize = 2;
@@ -172,7 +173,7 @@ pub fn show(parent: HWND) {
             RegisterClassW(&wc);
         }
         DONE.store(false, Ordering::SeqCst);
-        SAVED.store(false, Ordering::SeqCst);
+        *PENDING.lock().unwrap() = None;
 
         // Ukuran CLIENT diinginkan → window dibesarkan agar tombol OK/Cancel di
         // bawah tidak terpotong caption/border.
@@ -238,7 +239,12 @@ pub fn show(parent: HWND) {
         let _ = SetForegroundWindow(dlg);
 
         let mut msg = MSG::default();
-        while !DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        let _modal = crate::state::ModalGuard::new();
+        while !DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -251,20 +257,27 @@ pub fn show(parent: HWND) {
             let _ = DestroyWindow(dlg);
         }
 
-        if SAVED.load(Ordering::SeqCst) {
-            let clamp_h = |v: u32| (v.min(23)) as u8;
-            let clamp_m = |v: u32| (v.min(59)) as u8;
-            let mut days = [false; 7];
-            for (i, d) in days.iter_mut().enumerate() {
-                *d = get_check(ctrl(5 + i));
-            }
-            set(Schedule {
-                enabled: get_check(ctrl(0)),
-                start: (clamp_h(get_int(ctrl(1))), clamp_m(get_int(ctrl(2)))),
-                stop: (clamp_h(get_int(ctrl(3))), clamp_m(get_int(ctrl(4))),),
-                days,
-            });
+        if let Some(sched) = PENDING.lock().unwrap().take() {
+            set(sched);
         }
+    }
+}
+
+/// Baca semua kontrol jadi `Schedule`. HARUS dipanggil SEBELUM `DestroyWindow`
+/// — membaca kontrol yang sudah hancur menghasilkan 0/unchecked (scheduler
+/// dulu tak pernah bisa disimpan lewat UI karena dibaca setelah destroy).
+unsafe fn read_schedule() -> Schedule {
+    let clamp_h = |v: u32| (v.min(23)) as u8;
+    let clamp_m = |v: u32| (v.min(59)) as u8;
+    let mut days = [false; 7];
+    for (i, d) in days.iter_mut().enumerate() {
+        *d = get_check(ctrl(5 + i));
+    }
+    Schedule {
+        enabled: get_check(ctrl(0)),
+        start: (clamp_h(get_int(ctrl(1))), clamp_m(get_int(ctrl(2)))),
+        stop: (clamp_h(get_int(ctrl(3))), clamp_m(get_int(ctrl(4)))),
+        days,
     }
 }
 
@@ -274,7 +287,7 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             WM_COMMAND => {
                 match wparam.0 & 0xFFFF {
                     ID_OK => {
-                        SAVED.store(true, Ordering::SeqCst);
+                        *PENDING.lock().unwrap() = Some(read_schedule());
                         DONE.store(true, Ordering::SeqCst);
                         let _ = DestroyWindow(hwnd);
                     }

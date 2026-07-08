@@ -65,6 +65,11 @@ pub struct Row {
     pub user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies: Option<String>,
+    /// Unduhan YouTube (yt-dlp): (tag mode, batas tinggi). Resume/Redownload
+    /// harus me-restart lewat yt-dlp — engine HTTP hanya akan mengunduh HTML
+    /// halaman watch. Dipersist agar tetap benar setelah restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<(String, Option<u32>)>,
     pub category: Category,
 }
 
@@ -151,6 +156,7 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             referrer: None,
             user_agent: None,
             cookies: None,
+            youtube: None,
             category,
         });
     }
@@ -185,6 +191,7 @@ pub fn on_queued(id: u64, url: String, output: PathBuf) {
         referrer: None,
         user_agent: None,
         cookies: None,
+        youtube: None,
         category,
     });
 }
@@ -255,6 +262,14 @@ pub fn set_insecure(id: u64, val: bool) {
     if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
         r.insecure = val;
     }
+}
+
+/// Tandai baris sebagai unduhan YouTube (lihat field `youtube`).
+pub fn set_youtube(id: u64, mode_tag: String, height: Option<u32>) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.youtube = Some((mode_tag, height));
+    }
+    save();
 }
 
 /// Tandai baris berasal dari Site Grabber.
@@ -370,8 +385,11 @@ pub fn start_saver() {
 
 /// Tulis daftar ke `%APPDATA%\ADM\downloads.json` secara atomik (tmp + rename).
 fn write_now() {
-    let snapshot: Vec<Row> = ROWS.lock().unwrap().clone();
+    // Snapshot HARUS diambil di dalam SAVE_LOCK: kalau tidak, thread saver bisa
+    // meng-clone state lama, kalah lomba dengan save_now() (mis. saat exit),
+    // lalu menulis snapshot basi itu TERAKHIR — progres/status hilang di disk.
     let _guard = SAVE_LOCK.lock().unwrap();
+    let snapshot: Vec<Row> = ROWS.lock().unwrap().clone();
     let file = store_file();
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);

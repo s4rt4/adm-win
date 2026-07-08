@@ -50,7 +50,11 @@ impl Limiter {
             }
             let rate_f = rate as f64;
             let capacity = rate_f.max(64.0 * 1024.0);
-            let need = n as f64;
+            // Chunk lebih besar dari kapasitas bucket tak akan pernah tercukupi
+            // (token di-cap di kapasitas) → tunggu selamanya. Cukup syaratkan
+            // `min(n, capacity)`; sisa konsumsi jadi saldo negatif (utang) yang
+            // dibayar acquire berikutnya — rate rata-rata tetap akurat.
+            let need = (n as f64).min(capacity);
             let wait = {
                 let mut b = self.bucket.lock().await;
                 let now = Instant::now();
@@ -58,7 +62,7 @@ impl Limiter {
                 b.last = now;
                 b.tokens = (b.tokens + elapsed * rate_f).min(capacity);
                 if b.tokens >= need {
-                    b.tokens -= need;
+                    b.tokens -= n as f64; // boleh negatif untuk chunk raksasa
                     return;
                 }
                 Duration::from_secs_f64(((need - b.tokens) / rate_f).min(1.0))

@@ -37,6 +37,15 @@ pub fn is_dark() -> bool {
     crate::theme::effective_dark(crate::settings::get().theme)
 }
 
+/// Brush latar gelap (cache proses) — untuk handler `WM_CTLCOLOR*` manual di
+/// luar [`ctlcolor`] (mis. label empty-state di window utama).
+///
+/// # Safety
+/// Panggil dari UI thread.
+pub unsafe fn bg_brush() -> HBRUSH {
+    cached_brush(&BG_BRUSH, BG)
+}
+
 unsafe fn cached_brush(slot: &Mutex<isize>, color: (u8, u8, u8)) -> HBRUSH {
     let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
     if *g == 0 {
@@ -154,7 +163,16 @@ pub unsafe fn draw_combobox(lparam: LPARAM) -> Option<LRESULT> {
     let _ = DeleteObject(brush.into());
     // itemID == -1 → combobox kosong (belum ada pilihan): cukup latar.
     if dis.itemID as i32 >= 0 {
-        let mut buf = [0u16; 256];
+        // Tanya panjang dulu — CB_GETLBTEXT menyalin SELURUH string tanpa
+        // batas; buffer tetap = stack overflow untuk item panjang.
+        let len = SendMessageW(
+            dis.hwndItem,
+            CB_GETLBTEXTLEN,
+            Some(WPARAM(dis.itemID as usize)),
+            Some(LPARAM(0)),
+        )
+        .0;
+        let mut buf = vec![0u16; len.max(0) as usize + 1];
         SendMessageW(
             dis.hwndItem,
             CB_GETLBTEXT,

@@ -329,12 +329,13 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             let _ = UpdateWindow(hwnd);
         }
 
-        // Akselerator keyboard global (Ctrl+N add, Ctrl+F find, F3 next, Del hapus).
+        // Akselerator keyboard global (Ctrl+N add, Ctrl+F find, F3 next, Del hapus, Ctrl+Q exit).
         let accels = [
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'N' as u16, cmd: ID_ADD as u16 },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'F' as u16, cmd: ID_FIND as u16 },
             ACCEL { fVirt: FVIRTKEY, key: VK_F3.0, cmd: ID_FIND_NEXT as u16 },
             ACCEL { fVirt: FVIRTKEY, key: VK_DELETE.0, cmd: ID_REMOVE as u16 },
+            ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'Q' as u16, cmd: ID_EXIT as u16 },
         ];
         let haccel = CreateAcceleratorTableW(&accels).unwrap_or_default();
 
@@ -389,10 +390,22 @@ fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                 LRESULT(0)
             }
             WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                if state::TRAY_VISIBLE.load(Ordering::SeqCst) {
+                    let _ = ShowWindow(hwnd, SW_HIDE); // sembunyi ke tray
+                } else {
+                    // Ikon tray dimatikan: sembunyi = app hilang tanpa jalan
+                    // kembali. X berarti keluar.
+                    request_exit(hwnd);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // Batalkan semua unduhan (token cancel juga dipantau runner
+                // yt-dlp) — proses eksternal ikut mati via job object.
+                if let Some(e) = ENGINE.get() {
+                    e.cancel_all();
+                }
+                crate::youtube_playlist::pause_all();
                 store::save_now(); // flush sinkron progres terakhir sebelum keluar
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
@@ -400,6 +413,7 @@ fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
             }
             state::WM_PROGRESS => {
                 refresh_ui(hwnd);
+                flush_pending_adds(hwnd);
                 LRESULT(0)
             }
             state::WM_ACTIVATE_APP => {
@@ -410,8 +424,17 @@ fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                 let ptr = lparam.0 as *mut DownloadAddParams;
                 if !ptr.is_null() {
                     let params = *Box::from_raw(ptr);
-                    show_window(hwnd); // munculkan dari tray bila perlu
-                    show_add(hwnd, Some(params));
+                    if state::in_modal() {
+                        // Dialog modal (termasuk dialog Add lain) sedang buka:
+                        // loop modalnya men-dispatch pesan ini → show_add
+                        // re-entrant meng-clobber statics dialog & unduhan
+                        // pertama hilang. Antrikan; di-flush saat dialog tutup.
+                        PENDING_ADDS.lock().unwrap().push(params);
+                    } else {
+                        show_window(hwnd); // munculkan dari tray bila perlu
+                        show_add(hwnd, Some(params));
+                        flush_pending_adds(hwnd);
+                    }
                 }
                 LRESULT(0)
             }
@@ -454,9 +477,14 @@ fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                 }
             }
             WM_CTLCOLORSTATIC if lparam.0 == EMPTY_HWND.load(Ordering::SeqCst) => {
-                // Label empty-state berada di atas ListView putih → samakan latar.
+                // Label empty-state berada di atas ListView → samakan latar
+                // (dark: DARK_BG, terang: COLOR_WINDOW; jangan bocor putih).
                 let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
                 SetBkMode(hdc, TRANSPARENT);
+                if DARK.load(Ordering::SeqCst) {
+                    SetTextColor(hdc, rgb(120, 126, 138));
+                    return LRESULT(crate::dark::bg_brush().0 as isize);
+                }
                 SetTextColor(hdc, rgb(140, 140, 140));
                 LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
             }
@@ -1000,7 +1028,37 @@ unsafe fn refresh_list(lv: HWND) {
     let cur_ids: Vec<u64> = (0..count).filter_map(|i| item_id(lv, i)).collect();
     let want_ids: Vec<u64> = visible.iter().map(|r| r.id).collect();
     let rebuild = cur_ids != want_ids;
+    // Rebuild menghapus seleksi & fokus — fatal saat sort di kolom dinamis
+    // (speed/ETA memicu rebuild TIAP tick, seleksi user lenyap sebelum sempat
+    // dipakai). Simpan berdasarkan id, pulihkan setelah reinsert.
+    let mut sel_before: Vec<u64> = Vec::new();
+    let mut focus_before: Option<u64> = None;
     if rebuild {
+        let mut idx: i32 = -1;
+        loop {
+            let r = SendMessageW(
+                lv,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(idx as usize)),
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            );
+            if r.0 < 0 {
+                break;
+            }
+            idx = r.0 as i32;
+            if let Some(id) = item_id(lv, idx) {
+                sel_before.push(id);
+            }
+        }
+        let f = SendMessageW(
+            lv,
+            LVM_GETNEXTITEM,
+            Some(WPARAM(usize::MAX)),
+            Some(LPARAM(LVNI_FOCUSED as isize)),
+        );
+        if f.0 >= 0 {
+            focus_before = item_id(lv, f.0 as i32);
+        }
         SendMessageW(lv, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
     }
     for (i, r) in visible.iter().enumerate() {
@@ -1014,6 +1072,26 @@ unsafe fn refresh_list(lv: HWND) {
         set_subitem(lv, idx, 3, &status_text(r));
         set_subitem(lv, idx, 4, &fmt_eta(r.eta_secs()));
         set_subitem(lv, idx, 5, &fmt_speed(r.speed_bps));
+    }
+    if rebuild && (!sel_before.is_empty() || focus_before.is_some()) {
+        for (i, r) in visible.iter().enumerate() {
+            let mut state = 0u32;
+            if sel_before.contains(&r.id) {
+                state |= LVIS_SELECTED.0;
+            }
+            if focus_before == Some(r.id) {
+                state |= LVIS_FOCUSED.0;
+            }
+            if state != 0 {
+                let lvi = LVITEMW {
+                    mask: LVIF_STATE,
+                    stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
+                    state: LIST_VIEW_ITEM_STATE_FLAGS(state),
+                    ..Default::default()
+                };
+                SendMessageW(lv, LVM_SETITEMSTATE, Some(WPARAM(i)), Some(LPARAM(&lvi as *const _ as isize)));
+            }
+        }
     }
 }
 
@@ -1241,6 +1319,20 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                         continue;
                     }
                     if let Some(r) = store::get(*id) {
+                        // Sudah jalan/selesai → jangan restart (sesi kedua
+                        // menendang sesi berjalan); cukup tampilkan statusnya.
+                        if matches!(r.status, store::Status::Downloading | store::Status::Complete) {
+                            continue;
+                        }
+                        // Baris YouTube → restart via yt-dlp; engine HTTP hanya
+                        // akan mengunduh HTML halaman watch ke file output.
+                        if let Some((tag, height)) = r.youtube.clone() {
+                            if let Some(mode) = crate::youtube::mode_from_tag(&tag) {
+                                let req = crate::youtube::YtRequest { url: r.url.clone(), mode, height };
+                                crate::youtube::start_as(e, *id, req);
+                                continue;
+                            }
+                        }
                         let fname = r.filename();
                         e.resume(*id, r.url, fname, r.insecure, r.referrer, r.user_agent, r.cookies);
                     }
@@ -1417,27 +1509,37 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
         Category::Video,
     ];
     let Some(cat) = cats.get(idx).copied() else { return };
-    let Some(id) = selected_id() else { return };
-    let Some(row) = store::get(id) else { return };
-    if row.status == store::Status::Downloading {
-        info(hwnd, "Hentikan unduhan dulu sebelum memindah kategori.");
+    let ids = selected_ids();
+    if ids.is_empty() {
         return;
     }
     let Some(engine) = ENGINE.get() else { return };
-    let filename = row.filename();
-    let mut newdir = engine.download_dir();
-    if let Some(f) = cat.folder() {
-        newdir.push(f);
+    // Berlaku ke SEMUA baris terseleksi; yang sedang diunduh dilewati.
+    let mut skipped = 0usize;
+    for id in ids {
+        let Some(row) = store::get(id) else { continue };
+        if row.status == store::Status::Downloading {
+            skipped += 1;
+            continue;
+        }
+        let filename = row.filename();
+        let mut newdir = engine.download_dir();
+        if let Some(f) = cat.folder() {
+            newdir.push(f);
+        }
+        let _ = std::fs::create_dir_all(&newdir);
+        let newpath = newdir.join(&filename);
+        if newpath != row.output {
+            let _ = std::fs::rename(&row.output, &newpath);
+            adm_core::sidecar::rename_for(&row.output, &newpath);
+        }
+        store::move_category(id, newpath, cat);
     }
-    let _ = std::fs::create_dir_all(&newdir);
-    let newpath = newdir.join(&filename);
-    if newpath != row.output {
-        let _ = std::fs::rename(&row.output, &newpath);
-        adm_core::sidecar::rename_for(&row.output, &newpath);
-    }
-    store::move_category(id, newpath, cat);
     store::save();
     refresh_ui(hwnd);
+    if skipped > 0 {
+        info(hwnd, "Item yang sedang diunduh dilewati — hentikan dulu sebelum memindah kategori.");
+    }
 }
 
 unsafe fn do_add(hwnd: HWND) {
@@ -1770,6 +1872,8 @@ unsafe fn do_download_insecure(hwnd: HWND, id: u64) {
 /// Popup saat unduhan gagal. Bila error sertifikat TLS → tawarkan unduh dengan
 /// "terima risiko"; selain itu → tawarkan Refresh Link (link kedaluwarsa dll).
 unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
+    // MessageBox memompa pesan → tunda popup completion lain selama terbuka.
+    let _modal = state::ModalGuard::new();
     let err = row.last_error.clone().unwrap_or_default();
     if is_tls_error(&err) {
         let msg = HSTRING::from(format!(
@@ -1811,6 +1915,16 @@ unsafe fn do_redownload(hwnd: HWND) {
     e.cancel(id); // no-op bila tidak aktif
     let _ = std::fs::remove_file(&row.output);
     adm_core::sidecar::remove_for(&row.output);
+    // Baris YouTube → restart via yt-dlp (bukan engine HTTP).
+    if let Some((tag, height)) = row.youtube.clone() {
+        if let Some(mode) = crate::youtube::mode_from_tag(&tag) {
+            let req = crate::youtube::YtRequest { url: row.url.clone(), mode, height };
+            crate::youtube::start_as(e, id, req);
+            refresh_ui(hwnd);
+            crate::progress::open(hwnd, id);
+            return;
+        }
+    }
     let fname = row.filename();
     e.resume(id, row.url, fname, row.insecure, row.referrer, row.user_agent, row.cookies);
     refresh_ui(hwnd);
@@ -1830,7 +1944,12 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
         format!("Hapus {n} unduhan dari daftar?")
     };
     let h = HSTRING::from(prompt);
-    if MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("Konfirmasi hapus"), MB_YESNO | MB_ICONWARNING) != IDYES {
+    // MessageBox memompa pesan → tunda popup completion selama terbuka.
+    let confirmed = {
+        let _modal = state::ModalGuard::new();
+        MessageBoxW(Some(hwnd), PCWSTR(h.as_ptr()), w!("Konfirmasi hapus"), MB_YESNO | MB_ICONWARNING) == IDYES
+    };
+    if !confirmed {
         return;
     }
     let engine = ENGINE.get();
@@ -1843,6 +1962,7 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
         if crate::youtube_playlist::is_playlist(id) {
             crate::youtube_playlist::remove(id);
         }
+        let _ = crate::progress::take_completion_opts(id); // opsi per-unduhan ikut hangus
         if let Some(row) = store::remove(id) {
             if delete_file {
                 let _ = std::fs::remove_file(&row.output);
@@ -1898,21 +2018,31 @@ pub fn open_folder(path: &std::path::Path) {
         .spawn();
 }
 
+/// Status seluruh baris terseleksi (multi-select aware) — enable-state harus
+/// memakai SEMUA seleksi; dulu hanya baris pertama, jadi aksi batch tampak
+/// disabled padahal handler-nya memproses semua baris.
+unsafe fn selected_statuses() -> Vec<store::Status> {
+    selected_ids()
+        .iter()
+        .filter_map(|id| store::get(*id).map(|r| r.status))
+        .collect()
+}
+
 /// Enable/disable item menu "File" sesuai status download terpilih.
 /// Stop Download → sedang unduh; Remove → ada yang dipilih;
 /// Download Now → bisa dilanjut (paused/error/queued); Redownload → selesai/error.
 unsafe fn update_file_menu(menu: HMENU) {
     use store::Status;
-    let status = selected_id().and_then(store::get).map(|r| r.status);
-    let can_stop = matches!(status, Some(Status::Downloading));
-    let can_resume = matches!(status, Some(Status::Paused | Status::Error | Status::Queued));
-    let can_redo = matches!(status, Some(Status::Complete | Status::Error));
+    let statuses = selected_statuses();
+    let can_stop = statuses.iter().any(|s| matches!(s, Status::Downloading | Status::Queued));
+    let can_resume = statuses.iter().any(|s| matches!(s, Status::Paused | Status::Error | Status::Queued));
+    let can_redo = statuses.iter().any(|s| matches!(s, Status::Complete | Status::Error));
     let en = |id: usize, on: bool| {
         let flag = if on { MF_ENABLED } else { MF_GRAYED };
         let _ = EnableMenuItem(menu, id as u32, MF_BYCOMMAND | flag);
     };
     en(ID_STOP, can_stop);
-    en(ID_REMOVE, status.is_some());
+    en(ID_REMOVE, !statuses.is_empty());
     en(ID_DOWNLOAD_NOW, can_resume);
     en(ID_REDOWNLOAD, can_redo);
 }
@@ -1937,11 +2067,12 @@ unsafe fn append_en(menu: HMENU, id: usize, text: PCWSTR, enabled: bool) {
 
 unsafe fn show_context_menu(hwnd: HWND) {
     use store::Status;
-    let status = selected_id().and_then(store::get).map(|r| r.status);
-    // Resume/Start relevan saat stopped/error/queued; Stop saat sedang unduh.
-    let can_resume = matches!(status, Some(Status::Paused | Status::Error | Status::Queued));
-    let can_stop = matches!(status, Some(Status::Downloading));
-    let is_complete = matches!(status, Some(Status::Complete));
+    let statuses = selected_statuses();
+    // Resume/Start relevan saat stopped/error/queued; Stop saat sedang unduh
+    // (semantik "ada yang bisa", karena handler memproses semua seleksi).
+    let can_resume = statuses.iter().any(|s| matches!(s, Status::Paused | Status::Error | Status::Queued));
+    let can_stop = statuses.iter().any(|s| matches!(s, Status::Downloading | Status::Queued));
+    let is_complete = statuses.len() == 1 && matches!(statuses[0], Status::Complete);
 
     let menu = CreatePopupMenu().unwrap_or_default();
     append_en(menu, ID_OPEN, w!("Open"), is_complete);
@@ -2002,7 +2133,20 @@ unsafe fn refresh_ui(hwnd: HWND) {
     // selama loop itu, WM_PROGRESS lain bisa masuk dan memanggil refresh_ui lagi
     // (rekursif) → tanpa guard, dialog bisa bertumpuk. IN_POPUP memastikan hanya
     // satu lapis yang menampilkan popup, dan menguras semua secara berurutan.
-    if !IN_POPUP.swap(true, Ordering::SeqCst) {
+    // Saat dialog modal lain sedang terbuka (Add/Options/About/...), popup
+    // DITUNDA — memunculkannya dari dalam loop modal dialog lain merusak
+    // modality; ModalGuard menyenggol WM_PROGRESS saat dialog itu ditutup.
+    if !state::in_modal() && !IN_POPUP.swap(true, Ordering::SeqCst) {
+        // Panik di jalur popup (paint dialog dsb.) tertahan catch_unwind wndproc;
+        // tanpa guard Drop, IN_POPUP tersangkut `true` dan SEMUA notifikasi
+        // completion mati sampai app restart.
+        struct PopupGuard;
+        impl Drop for PopupGuard {
+            fn drop(&mut self) {
+                IN_POPUP.store(false, Ordering::SeqCst);
+            }
+        }
+        let _popup_guard = PopupGuard;
         let show_complete = crate::settings::get().show_complete_dialog;
         // Aksi penyelesaian per-unduhan (tab "Options on completion") dikumpulkan
         // dulu, dikerjakan setelah semua notifikasi selesai.
@@ -2036,11 +2180,15 @@ unsafe fn refresh_ui(hwnd: HWND) {
                 }
             }
             for row in failed {
+                // Buang opsi penyelesaian basi — kalau tidak, "exit/shutdown
+                // when done" yang dicentang bisa meledak saat id ini kelak
+                // selesai lewat resume, jauh setelah user lupa.
+                let _ = crate::progress::take_completion_opts(row.id);
                 crate::progress::close_for(row.id); // mis. link kedaluwarsa → tawarkan Refresh Link
                 show_failed_popup(hwnd, &row);
             }
         }
-        IN_POPUP.store(false, Ordering::SeqCst);
+        // (IN_POPUP dilepas oleh PopupGuard di akhir blok — panik-aman.)
 
         // "Turn off computer when done" (menang) lalu "Exit ADM when done".
         // Combo "Exit" diperlakukan sama dengan keluar aplikasi.
@@ -2062,24 +2210,45 @@ unsafe fn refresh_ui(hwnd: HWND) {
 /// Guard agar popup complete/failed tak bertumpuk saat refresh_ui re-entrant.
 static IN_POPUP: AtomicBool = AtomicBool::new(false);
 
+/// Titipan browser yang datang saat dialog modal terbuka (lihat WM_ADD_DOWNLOAD).
+static PENDING_ADDS: Mutex<Vec<DownloadAddParams>> = Mutex::new(Vec::new());
+
+/// Proses satu titipan tertunda bila tak ada dialog modal. Dipanggil setelah
+/// dialog tutup (nudge WM_PROGRESS dari ModalGuard) — satu per siklus; sisanya
+/// menyusul saat dialog yang baru dibuka ini ditutup lagi.
+unsafe fn flush_pending_adds(hwnd: HWND) {
+    if state::in_modal() {
+        return;
+    }
+    let next = {
+        let mut q = PENDING_ADDS.lock().unwrap();
+        if q.is_empty() { None } else { Some(q.remove(0)) }
+    };
+    if let Some(params) = next {
+        show_window(hwnd);
+        show_add(hwnd, Some(params));
+        flush_pending_adds(hwnd);
+    }
+}
+
 /// Enable/disable tombol toolbar sesuai seleksi & status (mirip §9.3 File menu).
 unsafe fn update_toolbar_state() {
     use store::Status;
     let Some(tb) = state::load_hwnd(&state::TOOLBAR_HWND) else { return };
-    let sel = selected_id().and_then(store::get).map(|r| r.status);
-    let complete = matches!(sel, Some(Status::Complete));
-    let active = matches!(
-        sel,
-        Some(Status::Downloading | Status::Paused | Status::Queued | Status::Error)
-    );
+    let statuses = selected_statuses();
+    let any = !statuses.is_empty();
+    let all_complete = any && statuses.iter().all(|s| matches!(s, Status::Complete));
+    let any_active = statuses
+        .iter()
+        .any(|s| matches!(s, Status::Downloading | Status::Paused | Status::Queued | Status::Error));
     let en = |id: usize, on: bool| {
         SendMessageW(tb, TB_ENABLEBUTTON, Some(WPARAM(id)), Some(LPARAM(on as isize)));
     };
-    en(ID_RESUME, active);
-    en(ID_STOP, active);
-    en(ID_REFRESH_LINK, active); // relevan saat belum selesai
-    en(ID_STOP_ALL, !complete); // aktif saat tanpa seleksi / sedang unduh
-    en(ID_DELETE, sel.is_some());
+    en(ID_RESUME, statuses.iter().any(|s| matches!(s, Status::Paused | Status::Queued | Status::Error)));
+    en(ID_STOP, statuses.iter().any(|s| matches!(s, Status::Downloading | Status::Queued)));
+    en(ID_REFRESH_LINK, any_active); // relevan saat belum selesai
+    en(ID_STOP_ALL, !all_complete); // aktif saat tanpa seleksi / sedang unduh
+    en(ID_DELETE, any);
     // Add URL & Delete Completed selalu aktif.
 }
 
@@ -2302,8 +2471,13 @@ fn show_about(parent: HWND) {
         let _ = SetForegroundWindow(dlg);
         let _ = SetFocus(Some(ok));
 
+        let _modal = state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !ABOUT_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !ABOUT_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -2837,6 +3011,11 @@ fn add_tray_icon(hwnd: HWND) {
     let nid = tray_data(hwnd);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        // Shell menyalin ikon — handle milik kita wajib dilepas (dulu bocor
+        // satu HICON setiap toggle tray icon).
+        if !nid.hIcon.is_invalid() {
+            let _ = DestroyIcon(nid.hIcon);
+        }
     }
 }
 

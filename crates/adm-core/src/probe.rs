@@ -50,6 +50,19 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe> {
             .map(|s| s.eq_ignore_ascii_case("bytes"))
             .unwrap_or(false);
         (total, accept_ranges)
+    } else if status.as_u16() == 416 {
+        // `Range: bytes=0-0` pada berkas KOSONG: server patuh membalas 416
+        // dengan `Content-Range: bytes */0`. Perlakukan sebagai file 0 byte
+        // (resumable; plan segmen kosong → langsung complete).
+        let total = headers
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range_total);
+        if total == Some(0) {
+            (Some(0), true)
+        } else {
+            return Err(crate::error::Error::BadStatus(416));
+        }
     } else {
         return Err(crate::error::Error::BadStatus(status.as_u16()));
     };

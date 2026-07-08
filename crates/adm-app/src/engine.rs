@@ -50,8 +50,11 @@ pub enum EngineEvent {
 
 pub type EventSink = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
-/// Unduhan aktif: id → (token cancel, limiter per-unduhan).
-type ActiveMap = HashMap<u64, (CancelToken, Arc<Limiter>)>;
+/// Unduhan aktif: id → (token cancel, limiter per-unduhan, generasi sesi).
+/// Generasi membedakan sesi lama vs baru untuk id yang sama: tanpa itu, task
+/// lama yang sedang mati (cancel → start ulang) menghapus entri milik sesi
+/// baru, membuat Stop/limiter tak mempan pada unduhan yang justru berjalan.
+type ActiveMap = HashMap<u64, (CancelToken, Arc<Limiter>, u64)>;
 
 struct QueueState {
     running: bool,
@@ -67,6 +70,8 @@ pub struct EngineHandle {
     sink: EventSink,
     active: Arc<Mutex<ActiveMap>>,
     next_id: Arc<AtomicU64>,
+    /// Penomor generasi sesi unduhan (lihat [`ActiveMap`]).
+    next_gen: Arc<AtomicU64>,
     queue: Arc<Mutex<QueueState>>,
     /// Limiter global (dibagi semua unduhan); live-adjustable.
     global_limiter: Arc<Limiter>,
@@ -80,6 +85,7 @@ impl EngineHandle {
             sink,
             active: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            next_gen: Arc::new(AtomicU64::new(1)),
             queue: Arc::new(Mutex::new(QueueState {
                 running: false,
                 max: 1,
@@ -97,7 +103,7 @@ impl EngineHandle {
 
     /// Batas kecepatan per-unduhan (byte/detik; `0` = tanpa batas). Live.
     pub fn set_limit(&self, id: u64, bps: u64) {
-        if let Some((_, lim)) = self.active.lock().unwrap().get(&id) {
+        if let Some((_, lim, _)) = self.active.lock().unwrap().get(&id) {
             lim.set_rate(bps);
         }
     }
@@ -128,16 +134,28 @@ impl EngineHandle {
     /// Batas unduhan antrian yang berjalan bersamaan.
     pub fn set_queue_max(&self, max: usize) {
         self.queue.lock().unwrap().max = max.max(1);
+        self.pump(); // batas naik saat antrian jalan → isi slot baru sekarang
     }
 
     pub fn cancel(&self, id: u64) {
-        if let Some((t, _)) = self.active.lock().unwrap().get(&id) {
+        if let Some((t, _, _)) = self.active.lock().unwrap().get(&id) {
             t.cancel();
+        }
+        // Item yang masih menunggu di antrian ikut dicabut — tanpa ini, item
+        // yang dihapus dari daftar "bangkit lagi" saat pump berikutnya.
+        let was_pending = {
+            let mut q = self.queue.lock().unwrap();
+            let before = q.pending.len();
+            q.pending.retain(|(i, _)| *i != id);
+            q.pending.len() != before
+        };
+        if was_pending && !self.active.lock().unwrap().contains_key(&id) {
+            (self.sink)(EngineEvent::Paused { id, downloaded: 0 });
         }
     }
 
     pub fn cancel_all(&self) {
-        for (t, _) in self.active.lock().unwrap().values() {
+        for (t, _, _) in self.active.lock().unwrap().values() {
             t.cancel();
         }
     }
@@ -171,10 +189,11 @@ impl EngineHandle {
     /// membunuh proses). Kembalikan token untuk dipantau runner.
     pub fn register(&self, id: u64) -> CancelToken {
         let token = CancelToken::new();
+        let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         self.active
             .lock()
             .unwrap()
-            .insert(id, (token.clone(), Arc::new(Limiter::unlimited())));
+            .insert(id, (token.clone(), Arc::new(Limiter::unlimited()), gen));
         token
     }
 
@@ -283,10 +302,19 @@ impl EngineHandle {
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
         let cancel = CancelToken::new();
         let per_limiter = Arc::new(Limiter::unlimited());
-        self.active
-            .lock()
-            .unwrap()
-            .insert(id, (cancel.clone(), per_limiter.clone()));
+        let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut a = self.active.lock().unwrap();
+            // Sesi lama untuk id yang sama (mis. Resume diklik saat masih
+            // Downloading, atau Redownload): batalkan — jangan biarkan dua
+            // sesi menulis file & sidecar yang sama berbarengan.
+            if let Some((old, _, _)) = a.insert(id, (cancel.clone(), per_limiter.clone(), gen)) {
+                old.cancel();
+            }
+        }
+        // Start manual mencabut item dari antrian pending — tanpa ini, pump
+        // berikutnya memulai id yang sama untuk kedua kalinya.
+        self.queue.lock().unwrap().pending.retain(|(i, _)| *i != id);
 
         // Baris instan dengan tebakan nama (agar list & dialog progres langsung
         // ada); dikoreksi setelah resolusi nama (Content-Disposition).
@@ -333,7 +361,14 @@ impl EngineHandle {
                 cookies: params.cookies.clone(),
             };
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
-            this.active.lock().unwrap().remove(&id);
+            {
+                // Hapus entri hanya bila masih milik sesi ini — sesi baru bisa
+                // sudah menggantikan entri id yang sama.
+                let mut a = this.active.lock().unwrap();
+                if a.get(&id).is_some_and(|(_, _, g)| *g == gen) {
+                    a.remove(&id);
+                }
+            }
             // Emit event terminal DULU sebelum memulai item antrian berikutnya.
             let ev = match res {
                 Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
@@ -399,21 +434,48 @@ fn url_basename(url: &str) -> Option<String> {
 
 fn pick_filename(params: &DownloadAddParams, id: u64) -> String {
     if let Some(f) = &params.filename {
-        if !f.is_empty() {
-            return sanitize(f);
+        let s = sanitize(f);
+        if !s.is_empty() {
+            return s;
         }
     }
     let path = params.url.split(['?', '#']).next().unwrap_or("");
     if let Some(seg) = path.rsplit('/').next() {
-        if !seg.is_empty() {
-            return sanitize(&adm_core::percent_decode(seg));
+        let s = sanitize(&adm_core::percent_decode(seg));
+        if !s.is_empty() {
+            return s;
         }
     }
     format!("download-{id}.bin")
 }
 
 pub(crate) fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
-        .collect()
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if "\\/:*?\"<>|".contains(c) || (c as u32) < 0x20 {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Win32 memangkas titik/spasi di akhir nama secara diam-diam saat create —
+    // nama di disk jadi beda dengan `row.output` (Open/hapus/cek-duplikat
+    // meleset). Pangkas sendiri agar konsisten.
+    while s.ends_with('.') || s.ends_with(' ') {
+        s.pop();
+    }
+    // Nama device Windows (CON, PRN, AUX, NUL, COM1-9, LPT1-9) tak boleh jadi
+    // stem nama berkas — open bisa gagal/menyasar device.
+    let stem = s.split('.').next().unwrap_or("");
+    let up = stem.to_ascii_uppercase();
+    let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (up.len() == 4
+            && (up.starts_with("COM") || up.starts_with("LPT"))
+            && up.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        s.insert(0, '_');
+    }
+    s
 }

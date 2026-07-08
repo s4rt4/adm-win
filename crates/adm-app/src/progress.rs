@@ -316,7 +316,11 @@ pub fn open(parent: HWND, id: u64) {
         .unwrap_or_default();
         SetWindowLongPtrW(segbar, GWLP_USERDATA, id as isize);
         // Timer animasi kilau (~30 FPS) — hanya menyapu saat sedang mengunduh.
-        SetTimer(Some(segbar), ANIM_TIMER, 33, None);
+        // Jangan pasang bila window gagal dibuat: SetTimer(HWND(0)) membuat
+        // THREAD timer 33ms yang tak pernah di-KillTimer.
+        if !segbar.is_invalid() {
+            SetTimer(Some(segbar), ANIM_TIMER, 33, None);
+        }
         t1.push(segbar);
 
         let conn = mk(
@@ -845,6 +849,10 @@ static CMPL_REG: AtomicBool = AtomicBool::new(false);
 static CMPL_DONE: AtomicBool = AtomicBool::new(false);
 static CMPL_PATH: Mutex<String> = Mutex::new(String::new());
 static CMPL_DONTSHOW: Mutex<isize> = Mutex::new(0); // HWND checkbox
+/// State checkbox "Don't show again", di-capture di WM_DESTROY — membaca
+/// kontrol SETELAH dialog hancur selalu menghasilkan 0 (preferensi tak
+/// pernah tersimpan).
+static CMPL_DONT: AtomicBool = AtomicBool::new(false);
 
 const IDB_OPEN: usize = 1;
 const IDB_OPENWITH: usize = 2;
@@ -875,6 +883,7 @@ pub fn show_complete(parent: HWND, row: &Row) {
             RegisterClassW(&wc);
         }
         CMPL_DONE.store(false, Ordering::SeqCst);
+        CMPL_DONT.store(false, Ordering::SeqCst);
         *CMPL_PATH.lock().unwrap() = row.output.to_string_lossy().into_owned();
 
         // Ukuran CLIENT yang diinginkan; window dibesarkan agar client = ini.
@@ -945,20 +954,21 @@ pub fn show_complete(parent: HWND, row: &Row) {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !CMPL_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !CMPL_DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
 
-        // "Don't show again" → simpan preferensi.
-        let dont = {
-            let h = *CMPL_DONTSHOW.lock().unwrap();
-            h != 0 && SendMessageW(HWND(h as *mut core::ffi::c_void), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1
-        };
-        if dont {
+        // "Don't show again" → simpan preferensi (di-capture WM_DESTROY).
+        if CMPL_DONT.load(Ordering::SeqCst) {
             crate::settings::update(|s| s.show_complete_dialog = false);
         }
 
@@ -1018,6 +1028,23 @@ extern "system" fn cmpl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             WM_CLOSE => {
                 CMPL_DONE.store(true, Ordering::SeqCst);
                 let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                // Anak (checkbox) masih hidup saat parent menerima WM_DESTROY —
+                // satu-satunya titik aman membaca state utk SEMUA jalur keluar.
+                let h = *CMPL_DONTSHOW.lock().unwrap();
+                if h != 0 {
+                    let checked = SendMessageW(
+                        HWND(h as *mut core::ffi::c_void),
+                        BM_GETCHECK,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0)),
+                    )
+                    .0 == 1;
+                    CMPL_DONT.store(checked, Ordering::SeqCst);
+                }
+                CMPL_DONE.store(true, Ordering::SeqCst);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

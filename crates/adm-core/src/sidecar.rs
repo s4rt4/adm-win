@@ -130,6 +130,23 @@ pub fn remove(path: &Path) {
 }
 
 impl Sidecar {
+    /// Rekaman segmen harus kontigu menutup `[0, total)` tanpa celah/tumpang-
+    /// tindih dan tanpa `end < start` — sidecar rusak (JSON valid tapi isinya
+    /// ngawur) bisa membuat `SegState::len` underflow atau file bolong.
+    pub fn segments_valid(&self, total: u64) -> bool {
+        if total == 0 {
+            return self.segments.is_empty();
+        }
+        let mut next = 0u64;
+        for s in &self.segments {
+            if s.start != next || s.end < s.start || s.end >= total {
+                return false;
+            }
+            next = s.end + 1;
+        }
+        next == total
+    }
+
     /// Apakah sidecar masih cocok dengan kondisi server saat ini (resume aman).
     ///
     /// Kunci kecocokan adalah **ukuran total** (sinyal identitas file). Bila URL

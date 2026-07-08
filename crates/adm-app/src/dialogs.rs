@@ -4,7 +4,7 @@
 
 use adm_ipc::DownloadAddParams;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -43,7 +43,13 @@ struct ProbeOut {
     total: u64,
     /// Nama dari `Content-Disposition` (sudah basename), bila ada.
     filename: Option<String>,
+    /// Generasi probe saat spawn — hasil probe URL LAMA yang datang telat
+    /// tidak boleh menimpa tampilan URL yang lebih baru.
+    gen: u64,
 }
+
+/// Generasi probe terkini (naik setiap spawn_size_probe).
+static PROBE_GEN: AtomicU64 = AtomicU64::new(0);
 
 const CLASS: PCWSTR = w!("AdmAddDialog");
 
@@ -297,8 +303,13 @@ fn dialog_impl(
         let _ = SetForegroundWindow(dlg);
 
         // Loop modal.
+        let _modal = crate::state::ModalGuard::new();
         let mut msg = MSG::default();
-        while !DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while !DONE.load(Ordering::SeqCst) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                PostQuitMessage(0); // teruskan WM_QUIT ke loop luar, jangan ditelan
+                break;
+            }
             if !IsDialogMessageW(dlg, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -388,6 +399,9 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     return LRESULT(0);
                 }
                 let out = *Box::from_raw(lparam.0 as *mut ProbeOut);
+                if out.gen != PROBE_GEN.load(Ordering::SeqCst) {
+                    return LRESULT(0); // hasil probe URL lama yang telat — abaikan
+                }
                 // Ukuran.
                 let h = *SIZE_LABEL.lock().unwrap();
                 if h != 0 {
@@ -453,11 +467,12 @@ unsafe fn spawn_size_probe(dlg: HWND, url: &str) {
         let url = url.to_string();
         let dlg_isize = dlg.0 as isize;
         let headers = PROBE_HEADERS.lock().unwrap().clone().unwrap_or_default();
+        let gen = PROBE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         eng.runtime().spawn(async move {
             let probe = adm_core::probe_url_with(&url, &headers, false).await.ok();
             let total = probe.as_ref().and_then(|p| p.total).unwrap_or(0);
             let filename = probe.and_then(|p| p.suggested_filename);
-            let payload = Box::into_raw(Box::new(ProbeOut { total, filename }));
+            let payload = Box::into_raw(Box::new(ProbeOut { total, filename, gen }));
             let dlg = HWND(dlg_isize as *mut core::ffi::c_void);
             let posted = PostMessageW(Some(dlg), WM_SIZE_RESULT, WPARAM(0), LPARAM(payload as isize)).is_ok();
             if !posted {
