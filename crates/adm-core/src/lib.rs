@@ -13,7 +13,7 @@ mod grabber;
 mod limiter;
 mod platform;
 mod probe;
-mod sidecar;
+pub mod sidecar;
 
 pub use download::{
     download, fetch_text, probe_url, probe_url_with, CancelToken, DownloadRequest, Outcome,

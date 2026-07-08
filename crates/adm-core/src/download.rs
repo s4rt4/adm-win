@@ -183,6 +183,7 @@ pub async fn download(
     };
     let client = build_client(req.insecure, &headers)?;
     let pr = probe::probe(&client, &req.url).await?;
+    sidecar::migrate_legacy(&req.output); // lokasi lama `<file>.adm` → folder state
     let sidecar_path = sidecar::path_for(&req.output);
 
     // Jalur non-resumable: ukuran tak diketahui atau Range tak didukung.

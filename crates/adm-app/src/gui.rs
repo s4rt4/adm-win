@@ -1433,11 +1433,7 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
     let newpath = newdir.join(&filename);
     if newpath != row.output {
         let _ = std::fs::rename(&row.output, &newpath);
-        let mut old_sc = row.output.clone().into_os_string();
-        old_sc.push(".adm");
-        let mut new_sc = newpath.clone().into_os_string();
-        new_sc.push(".adm");
-        let _ = std::fs::rename(&old_sc, &new_sc);
+        adm_core::sidecar::rename_for(&row.output, &newpath);
     }
     store::move_category(id, newpath, cat);
     store::save();
@@ -1814,9 +1810,7 @@ unsafe fn do_redownload(hwnd: HWND) {
     let Some(e) = ENGINE.get() else { return };
     e.cancel(id); // no-op bila tidak aktif
     let _ = std::fs::remove_file(&row.output);
-    let mut sidecar = row.output.clone().into_os_string();
-    sidecar.push(".adm");
-    let _ = std::fs::remove_file(sidecar);
+    adm_core::sidecar::remove_for(&row.output);
     let fname = row.filename();
     e.resume(id, row.url, fname, row.insecure, row.referrer, row.user_agent, row.cookies);
     refresh_ui(hwnd);
@@ -1852,9 +1846,7 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
         if let Some(row) = store::remove(id) {
             if delete_file {
                 let _ = std::fs::remove_file(&row.output);
-                let mut sc = row.output.clone().into_os_string();
-                sc.push(".adm");
-                let _ = std::fs::remove_file(sc);
+                adm_core::sidecar::remove_for(&row.output);
             }
         }
     }

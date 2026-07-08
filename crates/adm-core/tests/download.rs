@@ -242,7 +242,5 @@ async fn fallback_no_range() {
 }
 
 fn adm_core_sidecar_exists(output: &std::path::Path) -> bool {
-    let mut s = output.as_os_str().to_os_string();
-    s.push(".adm");
-    std::path::Path::new(&s).exists()
+    adm_core::sidecar::path_for(output).exists()
 }
