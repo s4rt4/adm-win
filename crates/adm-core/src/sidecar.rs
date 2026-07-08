@@ -39,17 +39,17 @@ pub fn load(path: &Path) -> Option<Sidecar> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Tulis sidecar secara atomik.
+/// Tulis sidecar di tempat (truncate + write), TANPA pola tmp+rename.
+///
+/// Sengaja tidak atomik: save dipanggil tiap 500 ms selama unduhan, dan
+/// create+rename memicu event direktori yang membuat Explorer me-refresh
+/// seluruh folder tujuan terus-menerus (isi folder "berkedip"). Menulis di
+/// tempat hanya memicu event modifikasi file ini saja. Risiko crash tepat di
+/// tengah tulis menghasilkan JSON tak valid → `load` mengembalikan None →
+/// unduhan mulai dari awal (degradasi anggun, bukan korupsi).
 pub fn save(path: &Path, sc: &Sidecar) -> std::io::Result<()> {
-    let tmp = {
-        let mut s = path.as_os_str().to_os_string();
-        s.push(".tmp");
-        PathBuf::from(s)
-    };
     let data = serde_json::to_vec(sc).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, &data)?;
-    std::fs::rename(&tmp, path)?; // MoveFileEx REPLACE_EXISTING di Windows
-    Ok(())
+    std::fs::write(path, &data)
 }
 
 pub fn remove(path: &Path) {
