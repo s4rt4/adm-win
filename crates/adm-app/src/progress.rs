@@ -854,8 +854,9 @@ const IDC_DONTSHOW: usize = 5;
 
 /// Dialog modal "Download complete" (§9.14): Open / Open with… / Open folder /
 /// Close + "Don't show this dialog again". Close hanya menutup (tak membuka file).
-/// Ditampilkan saat unduhan selesai bila opsi "Show download complete dialog"
-/// (tab Options on completion) dicentang; jika tidak, notifikasi pakai balon tray.
+/// Ditampilkan saat unduhan selesai bila setelan global `show_complete_dialog`
+/// aktif (default) atau dipaksa per-unduhan lewat tab "Options on completion";
+/// jika tidak, notifikasi pakai balon tray.
 pub fn show_complete(parent: HWND, row: &Row) {
     unsafe {
         let instance: HINSTANCE = match GetModuleHandleW(None) {

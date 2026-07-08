@@ -2025,12 +2025,13 @@ unsafe fn refresh_ui(hwnd: HWND) {
             for row in completed {
                 let opts = crate::progress::take_completion_opts(row.id);
                 crate::progress::close_for(row.id); // unduhan selesai → tutup dialog status
-                // Opsi per-unduhan menang atas setelan global.
-                if opts.map(|o| o.show_dialog).unwrap_or(false) {
-                    // Dialog modal "Download complete" (Open / Open folder / …).
+                // Dialog modal "Download complete" tampil bila setelan global
+                // aktif (default; dimatikan via "Don't show this dialog again")
+                // ATAU dipaksa per-unduhan lewat tab "Options on completion".
+                // Bila dialog mati, fallback ke balon tray non-modal.
+                if show_complete || opts.map(|o| o.show_dialog).unwrap_or(false) {
                     crate::progress::show_complete(hwnd, &row);
-                } else if show_complete {
-                    // Toast non-modal (bukan dialog modal yang menyela).
+                } else {
                     notify_balloon(hwnd, "Download selesai", &row.filename());
                 }
                 if let Some(o) = opts {
