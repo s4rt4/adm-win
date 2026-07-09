@@ -74,6 +74,61 @@ pub unsafe fn apply(hwnd: HWND) {
     let _ = InvalidateRect(Some(hwnd), None, true);
 }
 
+/// Terapkan ULANG tema (gelap ATAU terang) ke dialog yang sudah terbuka —
+/// dipakai saat user mengganti tema selagi dialog modeless (progress/playlist)
+/// tampil. Berbeda dengan [`apply`] yang satu arah (no-op saat terang), fungsi
+/// ini juga MENGEMBALIKAN kontrol ke tampilan terang, lalu memaksa repaint
+/// penuh (tanpa ini hanya kontrol yang kebetulan repaint yang berubah warna —
+/// dialog jadi belang gelap/terang).
+///
+/// # Safety
+/// `hwnd` harus window valid; panggil dari thread pemilik window (UI thread).
+pub unsafe fn retheme(hwnd: HWND) {
+    let dark = is_dark();
+    let flag = windows::core::BOOL(dark as i32);
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &flag as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<windows::core::BOOL>() as u32,
+    );
+    let _ = EnumChildWindows(Some(hwnd), Some(retheme_child), LPARAM(dark as isize));
+    let _ = RedrawWindow(
+        Some(hwnd),
+        None,
+        None,
+        RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME,
+    );
+}
+
+unsafe extern "system" fn retheme_child(child: HWND, lp: LPARAM) -> BOOL {
+    if lp.0 != 0 {
+        return theme_child(child, LPARAM(0));
+    }
+    // Kembali ke terang: tema standar + reset warna list/tree ke default sistem.
+    let _ = SetWindowTheme(child, w!("Explorer"), PCWSTR::null());
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(child, &mut cls);
+    let name = String::from_utf16_lossy(&cls[..n as usize]);
+    let bg = GetSysColor(COLOR_WINDOW) as isize;
+    let txt = GetSysColor(COLOR_WINDOWTEXT) as isize;
+    if name.eq_ignore_ascii_case("SysListView32") {
+        SendMessageW(child, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
+        SendMessageW(child, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg)));
+        SendMessageW(child, LVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt)));
+        // Subclass header (bila terpasang) self-gate via is_dark() → cukup repaint.
+        let hdr = SendMessageW(child, LVM_GETHEADER, Some(WPARAM(0)), Some(LPARAM(0)));
+        if hdr.0 != 0 {
+            let _ = InvalidateRect(Some(HWND(hdr.0 as *mut core::ffi::c_void)), None, true);
+        }
+    } else if name.eq_ignore_ascii_case("SysTreeView32") {
+        // -1 = CLR_DEFAULT (kembalikan ke warna bawaan).
+        SendMessageW(child, TVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(-1)));
+        SendMessageW(child, TVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(-1)));
+    }
+    BOOL(1)
+}
+
 unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
     // DarkMode_Explorer membuat tombol/edit/scrollbar/combo dirender gelap di Win10+.
     let _ = SetWindowTheme(child, w!("DarkMode_Explorer"), PCWSTR::null());
@@ -146,19 +201,29 @@ pub fn combo_style() -> u32 {
 /// # Safety
 /// `lparam` harus pointer `DRAWITEMSTRUCT` valid dari pesan `WM_DRAWITEM`.
 pub unsafe fn draw_combobox(lparam: LPARAM) -> Option<LRESULT> {
-    if !is_dark() || lparam.0 == 0 {
+    if lparam.0 == 0 {
         return None;
     }
     let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
     if dis.CtlType != ODT_COMBOBOX {
         return None;
     }
+    // Combobox owner-draw dibuat saat tema gelap; bila user pindah ke terang
+    // selagi dialog terbuka, tetap HARUS digambar (default proc tak menggambar
+    // owner-draw → kotak kosong) — pakai warna sistem terang.
+    let dark = is_dark();
     let hdc = dis.hDC;
     let rc = dis.rcItem;
     // Item di dropdown yang tersorot → latar sorotan; selain itu latar field.
     let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
-    let bg = if selected { SEL_BG } else { EDIT_BG };
-    let brush = CreateSolidBrush(rgb(bg));
+    let (bg_col, txt_col) = if dark {
+        (rgb(if selected { SEL_BG } else { EDIT_BG }), rgb(TEXT))
+    } else if selected {
+        (COLORREF(GetSysColor(COLOR_HIGHLIGHT)), COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)))
+    } else {
+        (COLORREF(GetSysColor(COLOR_WINDOW)), COLORREF(GetSysColor(COLOR_WINDOWTEXT)))
+    };
+    let brush = CreateSolidBrush(bg_col);
     FillRect(hdc, &rc, brush);
     let _ = DeleteObject(brush.into());
     // itemID == -1 → combobox kosong (belum ada pilihan): cukup latar.
@@ -182,7 +247,7 @@ pub unsafe fn draw_combobox(lparam: LPARAM) -> Option<LRESULT> {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
         let mut wide: Vec<u16> = buf[..len].to_vec();
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(TEXT));
+        SetTextColor(hdc, txt_col);
         let mut tr = RECT { left: rc.left + 5, ..rc };
         DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }

@@ -181,14 +181,34 @@ fn register(args: &[String]) {
         eprintln!("usage: adm-bridge register <chrome/edge-extension-id> [firefox-extension-id]");
         std::process::exit(2);
     });
+    // ID Chrome/Edge selalu 32 huruf a-p; tolak selain itu (typo/salah tempel
+    // menghasilkan manifest yang diam-diam tak pernah cocok).
+    if chrome_id.len() != 32 || !chrome_id.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+        eprintln!("[bridge] extension id tidak valid: {chrome_id} (harus 32 huruf a-p)");
+        std::process::exit(2);
+    }
     let firefox_id = args.get(2).cloned();
 
-    let exe_str = exe.to_string_lossy().replace('\\', "\\\\");
+    // Manifest dibangun via serde_json agar path/ID ter-escape benar
+    // (backslash, kutip, dsb.) — bukan format string manual.
+    let manifest_json = |origins_key: &str, origins_val: serde_json::Value| {
+        let v = serde_json::json!({
+            "name": HOST_NAME,
+            "description": "Alpha Download Manager host",
+            "path": exe.to_string_lossy(),
+            "type": "stdio",
+            origins_key: origins_val,
+        });
+        let mut body = serde_json::to_vec_pretty(&v).expect("serialisasi manifest");
+        body.push(b'\n');
+        body
+    };
 
     // Manifest Chrome/Edge (allowed_origins).
     let chrome_manifest = dir.join("com.adm.bridge.json");
-    let chrome_json = format!(
-        "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"Alpha Download Manager host\",\n  \"path\": \"{exe_str}\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{chrome_id}/\"]\n}}\n"
+    let chrome_json = manifest_json(
+        "allowed_origins",
+        serde_json::json!([format!("chrome-extension://{chrome_id}/")]),
     );
     std::fs::write(&chrome_manifest, chrome_json).expect("tulis manifest chrome");
     reg_add("HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts", &chrome_manifest);
@@ -197,9 +217,7 @@ fn register(args: &[String]) {
     // Manifest Firefox (allowed_extensions).
     if let Some(fid) = firefox_id {
         let ff_manifest = dir.join("com.adm.bridge.firefox.json");
-        let ff_json = format!(
-            "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"Alpha Download Manager host\",\n  \"path\": \"{exe_str}\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{fid}\"]\n}}\n"
-        );
+        let ff_json = manifest_json("allowed_extensions", serde_json::json!([fid]));
         std::fs::write(&ff_manifest, ff_json).expect("tulis manifest firefox");
         reg_add("HKCU\\Software\\Mozilla\\NativeMessagingHosts", &ff_manifest);
     }

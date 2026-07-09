@@ -20,16 +20,64 @@ fn open(access: REG_SAM_FLAGS) -> Option<HKEY> {
     }
 }
 
-/// Apakah autostart aktif.
-pub fn is_enabled() -> bool {
-    let Some(hkey) = open(KEY_QUERY_VALUE) else {
-        return false;
+/// Perintah yang diharapkan di value Run untuk exe saat ini.
+fn expected_cmd() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("\"{exe}\" --tray")
+}
+
+/// Baca isi value Run "ADM" (None = tidak ada).
+fn entry_value() -> Option<String> {
+    let hkey = open(KEY_QUERY_VALUE)?;
+    let mut size: u32 = 0;
+    let rc = unsafe { RegQueryValueExW(hkey, VALUE_NAME, None, None, None, Some(&mut size)) };
+    if rc != ERROR_SUCCESS || size == 0 {
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe {
+        RegQueryValueExW(hkey, VALUE_NAME, None, None, Some(buf.as_mut_ptr()), Some(&mut size))
     };
-    let rc = unsafe { RegQueryValueExW(hkey, VALUE_NAME, None, None, None, None) };
     unsafe {
         let _ = RegCloseKey(hkey);
     }
-    rc == ERROR_SUCCESS
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    buf.truncate(size as usize);
+    let wide: Vec<u16> = buf
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&wide))
+}
+
+/// Apakah autostart aktif DAN menunjuk exe saat ini. Value yang ada tapi
+/// menunjuk exe lama (mis. bekas `target\release` yang sudah dihapus)
+/// dianggap TIDAK aktif agar ditulis ulang, bukan dibiarkan basi.
+pub fn is_enabled() -> bool {
+    entry_value().is_some_and(|v| v.eq_ignore_ascii_case(&expected_cmd()))
+}
+
+/// Samakan registry dengan setting saat startup: perbaiki entri basi
+/// (path exe lama) dan hapus entri bila setting mati.
+pub fn sync(want: bool) {
+    match (want, entry_value()) {
+        (true, v) if v.as_deref().map(str::to_ascii_lowercase)
+            != Some(expected_cmd().to_ascii_lowercase()) => {
+            set(true);
+        }
+        (false, Some(_)) => {
+            set(false);
+        }
+        _ => {}
+    }
 }
 
 /// Aktif/nonaktifkan autostart. Nilai = `"<exe>" --tray`.

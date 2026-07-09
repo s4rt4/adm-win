@@ -5,48 +5,146 @@ const HOST = "com.adm.bridge";
 
 // Anti-duplikat: lewati URL yang sama yang baru dikirim < 5 detik lalu
 // (onCreated bisa terpicu lebih dari sekali untuk satu unduhan).
+// URL ditandai hanya SETELAH kirim ke bridge sukses, agar kegagalan
+// transien tidak menelan percobaan ulang < 5 detik berikutnya.
 const recentlySent = new Map();
 function isDuplicate(url) {
   const now = Date.now();
   for (const [u, t] of recentlySent) if (now - t > 5000) recentlySent.delete(u);
-  if (recentlySent.has(url) && now - recentlySent.get(url) < 5000) return true;
-  recentlySent.set(url, now);
-  return false;
+  return recentlySent.has(url) && now - recentlySent.get(url) < 5000;
+}
+function markSent(url) {
+  recentlySent.set(url, Date.now());
 }
 
+// `enabled` dibaca async dari storage; service worker MV3 bisa bangun dan
+// menerima onCreated SEBELUM get() resolve — tunggu enabledReady dulu agar
+// toggle OFF tidak diabaikan pada event pertama.
 let enabled = true;
-chrome.storage.local.get({ enabled: true }, (v) => { enabled = v.enabled; });
+const enabledReady = chrome.storage.local
+  .get({ enabled: true })
+  .then((v) => { enabled = v.enabled; })
+  .catch(() => {});
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.enabled) enabled = changes.enabled.newValue;
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: "adm-download",
-    title: "Download with ADM",
-    contexts: ["link"],
+  // removeAll dulu: saat ekstensi di-update, create id yang sama melempar
+  // "duplicate id".
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: "adm-download",
+      title: "Download with ADM",
+      contexts: ["link"],
+    });
   });
 });
 
 // Klik kanan pada link → kirim ke ADM (selalu, walau toggle off).
 chrome.contextMenus.onClicked.addListener((info) => {
   const url = info.linkUrl || info.srcUrl;
-  if (url) sendToAdm(url, undefined, info.pageUrl);
+  if (url && !isDuplicate(url)) sendToAdm(url, undefined, info.pageUrl);
 });
 
-// Tangkap unduhan baru: batalkan di browser, serahkan ke ADM.
+// URL yang baru saja di-POST (unduhan hasil form/XHR POST tidak boleh
+// dicegat: ADM mengulanginya sebagai GET → konten salah). TTL 30 detik.
+const recentPost = new Map();
+chrome.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (d.method !== "POST") return;
+    const now = Date.now();
+    for (const [u, t] of recentPost) if (now - t > 30000) recentPost.delete(u);
+    recentPost.set(d.url, now);
+  },
+  { urls: ["<all_urls>"] }
+);
+function isRecentPost(url) {
+  const t = recentPost.get(url);
+  return t !== undefined && Date.now() - t < 30000;
+}
+
+// Hint nama file dari onDeterminingFilename (sudah termasuk Content-Disposition
+// yang di-parse browser) — onCreated sering belum punya filename.
+const nameWaiters = new Map(); // downloadId -> resolve(filename)
+chrome.downloads.onDeterminingFilename.addListener((item) => {
+  const w = nameWaiters.get(item.id);
+  if (w) {
+    nameWaiters.delete(item.id);
+    w(item.filename);
+  }
+});
+function filenameHint(downloadId, ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      nameWaiters.delete(downloadId);
+      resolve(undefined);
+    }, ms);
+    nameWaiters.set(downloadId, (name) => {
+      clearTimeout(t);
+      resolve(name);
+    });
+  });
+}
+
+async function downloadState(downloadId) {
+  try {
+    const items = await chrome.downloads.search({ id: downloadId });
+    return items && items[0] ? items[0].state : undefined;
+  } catch (e) {
+    return undefined;
+  }
+}
+
+// Tangkap unduhan baru: KIRIM ke ADM dulu; batalkan di browser hanya setelah
+// bridge mengonfirmasi sukses. Bila gagal, unduhan browser dilanjutkan —
+// jangan pernah cancel+erase sebelum ADM menerima (download bisa hilang total).
 chrome.downloads.onCreated.addListener(async (item) => {
+  await enabledReady;
   if (!enabled) return;
   const url = item.finalUrl || item.url;
   if (!url || !/^https?:/i.test(url)) return;
-  try {
-    await chrome.downloads.cancel(item.id);
-    await chrome.downloads.erase({ id: item.id });
-  } catch (e) {
-    /* sudah selesai/tak bisa dibatalkan — abaikan */
+  if (isRecentPost(url)) return; // hasil POST → biarkan browser
+  if (isDuplicate(url)) {
+    // Sudah dikirim ke ADM < 5 dtk lalu → ini duplikat event browser; buang.
+    try {
+      await chrome.downloads.cancel(item.id);
+      await chrome.downloads.erase({ id: item.id });
+    } catch (e) {
+      /* abaikan */
+    }
+    return;
   }
-  const filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
-  sendToAdm(url, filename, item.referrer);
+  // Tahan (pause) selama menunggu ADM, bukan cancel — masih bisa dilanjutkan.
+  let paused = true;
+  try {
+    await chrome.downloads.pause(item.id);
+  } catch (e) {
+    paused = false; // mungkin sudah selesai (file kecil) / tak bisa di-pause
+  }
+  let filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
+  if (!filename) {
+    const hinted = await filenameHint(item.id, 1500);
+    if (hinted) filename = hinted.split(/[\\/]/).pop() || undefined;
+  }
+  // File kecil bisa keburu selesai — cancel/erase pada unduhan complete hanya
+  // menghapus riwayat, file tetap ada → jadi dobel dengan ADM. Biarkan browser.
+  if ((await downloadState(item.id)) === "complete") return;
+  const ok = await sendToAdm(url, filename, item.referrer);
+  if (ok) {
+    try {
+      await chrome.downloads.cancel(item.id);
+      await chrome.downloads.erase({ id: item.id });
+    } catch (e) {
+      /* sudah selesai/tak bisa dibatalkan — abaikan */
+    }
+  } else if (paused) {
+    try {
+      await chrome.downloads.resume(item.id);
+    } catch (e) {
+      /* abaikan */
+    }
+  }
 });
 
 // Kumpulkan Cookie header untuk URL agar unduhan ber-autentikasi (mis. lampiran
@@ -63,17 +161,26 @@ async function cookieHeaderFor(url) {
   return "";
 }
 
+// Kirim ke ADM via bridge; resolve true hanya bila bridge menjawab {ok:true}.
+// URL ditandai recentlySent hanya saat sukses agar retry cepat tak tertelan.
 async function sendToAdm(url, filename, referrer) {
-  if (isDuplicate(url)) return;
   const msg = { method: "download.add", url, userAgent: navigator.userAgent };
   if (filename) msg.filename = filename;
   if (referrer) msg.referrer = referrer;
   const cookie = await cookieHeaderFor(url);
   if (cookie) msg.cookies = cookie;
-  chrome.runtime.sendNativeMessage(HOST, msg, () => {
-    if (chrome.runtime.lastError) {
-      console.warn("ADM bridge:", chrome.runtime.lastError.message);
-    }
+  return new Promise((resolve) => {
+    chrome.runtime.sendNativeMessage(HOST, msg, (resp) => {
+      if (chrome.runtime.lastError) {
+        console.warn("ADM bridge:", chrome.runtime.lastError.message);
+        resolve(false);
+        return;
+      }
+      const ok = !!(resp && resp.ok);
+      if (ok) markSent(url);
+      else console.warn("ADM bridge menolak:", resp && resp.error);
+      resolve(ok);
+    });
   });
 }
 
@@ -204,6 +311,6 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
         .catch(() => {});
     }
   } else if (msg.type === "adm-download" && msg.url) {
-    sendToAdm(msg.url, msg.filename, sender.tab.url);
+    if (!isDuplicate(msg.url)) sendToAdm(msg.url, msg.filename, sender.tab.url);
   }
 });

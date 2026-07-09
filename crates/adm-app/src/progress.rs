@@ -23,6 +23,7 @@ const IDC_CANCEL: usize = 2;
 const IDC_HIDE: usize = 3;
 const IDC_SL_CHECK: usize = 10;
 const IDC_SL_EDIT: usize = 11;
+const IDC_SL_REMEMBER: usize = 16; // Remember setting on stop/resume
 const IDC_OC_DLG: usize = 12; // Show download complete dialog
 const IDC_OC_EXIT: usize = 13; // Exit ADM when done
 const IDC_OC_POWER: usize = 14; // Turn off computer when done
@@ -93,6 +94,20 @@ fn set_completion_opts(id: u64, opts: CompletionOpts) {
     }
 }
 
+/// Terapkan ulang tema ke semua dialog progres yang sedang terbuka (dipanggil
+/// saat user mengganti tema agar dialog tak belang gelap/terang).
+pub fn retheme_open() {
+    let hwnds: Vec<isize> = OPEN_DIALOGS.lock().unwrap().iter().map(|(_, h)| *h).collect();
+    for h in hwnds {
+        unsafe {
+            let hwnd = HWND(h as *mut core::ffi::c_void);
+            if IsWindow(Some(hwnd)).as_bool() {
+                crate::dark::retheme(hwnd);
+            }
+        }
+    }
+}
+
 /// Tutup dialog progres untuk unduhan `id` (dipanggil saat selesai).
 pub fn close_for(id: u64) {
     let hwnds: Vec<isize> = {
@@ -129,6 +144,7 @@ struct DlgData {
     tabs: [Vec<HWND>; 3],
     chk_limit: HWND,
     edit_limit: HWND,
+    chk_remember: HWND,
     chk_oc_dlg: HWND,
     chk_oc_exit: HWND,
     chk_oc_power: HWND,
@@ -351,7 +367,8 @@ pub fn open(parent: HWND, id: u64) {
         let edit_limit = mk(dlg, w!("EDIT"), w!("0"), WINDOW_STYLE(WS_BORDER.0 | ES_NUMBER as u32), 190, 110, 80, 22, IDC_SL_EDIT);
         t2.push(edit_limit);
         t2.push(label(dlg, "KBytes/sec", 280, 112, 80));
-        t2.push(mk(dlg, w!("BUTTON"), w!("Remember setting on stop/resume"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 144, 300, 20, 0));
+        let chk_remember = mk(dlg, w!("BUTTON"), w!("Remember setting on stop/resume"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 144, 300, 20, IDC_SL_REMEMBER);
+        t2.push(chk_remember);
         for h in &t2 {
             let _ = ShowWindow(*h, SW_HIDE);
         }
@@ -404,6 +421,7 @@ pub fn open(parent: HWND, id: u64) {
             tabs: [t1, t2, t3],
             chk_limit,
             edit_limit,
+            chk_remember,
             chk_oc_dlg,
             chk_oc_exit,
             chk_oc_power,
@@ -415,6 +433,17 @@ pub fn open(parent: HWND, id: u64) {
 
         if let Some(r) = &row {
             set_text(lbl_url, &r.url);
+        }
+        // Restore tab Speed Limiter dari batas yang tersimpan di engine agar
+        // reopen dialog tidak tampil kosong padahal limit sedang aktif.
+        if let Some(e) = crate::gui::engine() {
+            if let Some((bps, remember)) = e.get_limit(id) {
+                if bps > 0 {
+                    SendMessageW(chk_limit, BM_SETCHECK, Some(WPARAM(1)), Some(LPARAM(0)));
+                    SendMessageW(chk_remember, BM_SETCHECK, Some(WPARAM(if remember { 1 } else { 0 })), Some(LPARAM(0)));
+                    set_text(edit_limit, &(bps / 1024).to_string());
+                }
+            }
         }
         refresh(dlg);
         SetTimer(Some(dlg), TIMER_ID, 400, None);
@@ -571,7 +600,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 if let Some(d) = data_of(hwnd) {
                     let did = d.id;
                     match id {
-                        IDC_SL_CHECK => apply_limit(hwnd),
+                        IDC_SL_CHECK | IDC_SL_REMEMBER => apply_limit(hwnd),
                         IDC_SL_EDIT
                             if code == EN_CHANGE as usize || code == EN_KILLFOCUS as usize =>
                         {
@@ -586,6 +615,16 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                 if let Some(r) = store::get(did) {
                                     if r.status == Status::Downloading {
                                         e.cancel(did);
+                                    } else if let Some(mode) = r
+                                        .youtube
+                                        .as_ref()
+                                        .and_then(|(tag, _)| crate::youtube::mode_from_tag(tag))
+                                    {
+                                        // Baris YouTube → restart via yt-dlp; engine
+                                        // HTTP hanya akan mengunduh HTML halaman watch.
+                                        let height = r.youtube.as_ref().and_then(|(_, h)| *h);
+                                        let req = crate::youtube::YtRequest { url: r.url.clone(), mode, height };
+                                        crate::youtube::start_as(&e, did, req);
                                     } else {
                                         let f = r.filename();
                                         e.resume(did, r.url, f, r.insecure, r.referrer, r.user_agent, r.cookies);
@@ -628,10 +667,11 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 unsafe fn apply_limit(hwnd: HWND) {
     let Some(d) = data_of(hwnd) else { return };
     let checked = SendMessageW(d.chk_limit, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
+    let remember = SendMessageW(d.chk_remember, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
     let kb = read_uint(d.edit_limit);
     let bps = if checked { kb * 1024 } else { 0 };
     if let Some(e) = crate::gui::engine() {
-        e.set_limit(d.id, bps);
+        e.set_limit(d.id, bps, remember);
     }
 }
 

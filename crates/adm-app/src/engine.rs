@@ -75,6 +75,11 @@ pub struct EngineHandle {
     queue: Arc<Mutex<QueueState>>,
     /// Limiter global (dibagi semua unduhan); live-adjustable.
     global_limiter: Arc<Limiter>,
+    /// Batas kecepatan per-unduhan yang diinginkan user: id → (bps, remember).
+    /// Diterapkan ulang saat sesi baru dimulai (limiter dibuat per-sesi, tanpa
+    /// map ini limit hilang setiap pause→resume dan no-op untuk paused/queued).
+    /// Entri `remember == false` dibuang saat sesinya berakhir.
+    per_limits: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
 }
 
 impl EngineHandle {
@@ -93,6 +98,7 @@ impl EngineHandle {
                 running_ids: HashSet::new(),
             })),
             global_limiter: Arc::new(Limiter::unlimited()),
+            per_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -101,11 +107,31 @@ impl EngineHandle {
         self.global_limiter.set_rate(bps);
     }
 
-    /// Batas kecepatan per-unduhan (byte/detik; `0` = tanpa batas). Live.
-    pub fn set_limit(&self, id: u64, bps: u64) {
+    /// Batas kecepatan per-unduhan (byte/detik; `0` = tanpa batas). Live untuk
+    /// sesi aktif, dan diingat untuk sesi berikutnya (paused/queued/resume);
+    /// `remember == false` berarti hanya untuk sesi ini (dibuang saat berakhir).
+    pub fn set_limit(&self, id: u64, bps: u64, remember: bool) {
+        {
+            let mut pl = self.per_limits.lock().unwrap();
+            if bps == 0 {
+                pl.remove(&id);
+            } else {
+                pl.insert(id, (bps, remember));
+            }
+        }
         if let Some((_, lim, _)) = self.active.lock().unwrap().get(&id) {
             lim.set_rate(bps);
         }
+    }
+
+    /// Batas per-unduhan yang tersimpan (untuk restore UI): (bps, remember).
+    pub fn get_limit(&self, id: u64) -> Option<(u64, bool)> {
+        self.per_limits.lock().unwrap().get(&id).copied()
+    }
+
+    /// Buang batas per-unduhan (dipanggil saat baris dihapus dari daftar).
+    pub fn clear_limit(&self, id: u64) {
+        self.per_limits.lock().unwrap().remove(&id);
     }
 
     pub fn download_dir(&self) -> PathBuf {
@@ -186,20 +212,31 @@ impl EngineHandle {
 
     /// Daftarkan token pembatalan untuk unduhan eksternal `id`; `cancel(id)` /
     /// `cancel_all` / `stop_queue` akan men-set token ini (runner memantau &
-    /// membunuh proses). Kembalikan token untuk dipantau runner.
-    pub fn register(&self, id: u64) -> CancelToken {
+    /// membunuh proses). Kembalikan (token, generasi) — generasi diserahkan
+    /// kembali ke [`Self::unregister`]. Sesi lama untuk id yang sama dibatalkan
+    /// (pola yang sama dengan `start()`): tanpa ini, runner lama yang sedang
+    /// mati bisa menghapus token milik sesi baru sehingga Stop tak mempan.
+    pub fn register(&self, id: u64) -> (CancelToken, u64) {
         let token = CancelToken::new();
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
-        self.active
-            .lock()
-            .unwrap()
-            .insert(id, (token.clone(), Arc::new(Limiter::unlimited()), gen));
-        token
+        let mut a = self.active.lock().unwrap();
+        if let Some((old, _, _)) = a.insert(id, (token.clone(), Arc::new(Limiter::unlimited()), gen)) {
+            old.cancel();
+        }
+        (token, gen)
     }
 
-    /// Lepas pendaftaran unduhan eksternal (dipanggil runner saat selesai/gagal).
-    pub fn unregister(&self, id: u64) {
-        self.active.lock().unwrap().remove(&id);
+    /// Lepas pendaftaran unduhan eksternal (dipanggil runner saat selesai/
+    /// gagal). Hanya melepas bila entri masih milik generasi `gen`; kembalikan
+    /// true bila sesi ini masih pemiliknya (pemanggil boleh emit event
+    /// terminal — sesi yang sudah digantikan tidak boleh, lihat `start()`).
+    pub fn unregister(&self, id: u64, gen: u64) -> bool {
+        let mut a = self.active.lock().unwrap();
+        let owns = a.get(&id).is_some_and(|(_, _, g)| *g == gen);
+        if owns {
+            a.remove(&id);
+        }
+        owns
     }
 
     /// Lanjutkan unduhan yang sudah ada (segera). `insecure` mengabaikan
@@ -302,6 +339,11 @@ impl EngineHandle {
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
         let cancel = CancelToken::new();
         let per_limiter = Arc::new(Limiter::unlimited());
+        // Terapkan ulang batas per-unduhan yang diminta user (limit yang diset
+        // saat paused/queued, atau yang di-"Remember" dari sesi sebelumnya).
+        if let Some((bps, _)) = self.per_limits.lock().unwrap().get(&id).copied() {
+            per_limiter.set_rate(bps);
+        }
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         {
             let mut a = self.active.lock().unwrap();
@@ -361,21 +403,33 @@ impl EngineHandle {
                 cookies: params.cookies.clone(),
             };
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
-            {
+            let owns_entry = {
                 // Hapus entri hanya bila masih milik sesi ini — sesi baru bisa
                 // sudah menggantikan entri id yang sama.
                 let mut a = this.active.lock().unwrap();
-                if a.get(&id).is_some_and(|(_, _, g)| *g == gen) {
+                let owns = a.get(&id).is_some_and(|(_, _, g)| *g == gen);
+                if owns {
                     a.remove(&id);
+                    // Limit non-"Remember" hanya berlaku sesi ini.
+                    let mut pl = this.per_limits.lock().unwrap();
+                    if pl.get(&id).is_some_and(|(_, remember)| !remember) {
+                        pl.remove(&id);
+                    }
                 }
-            }
-            // Emit event terminal DULU sebelum memulai item antrian berikutnya.
-            let ev = match res {
-                Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
-                Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
-                Err(e) => EngineEvent::Failed { id, error: error_chain(&e) },
+                owns
             };
-            (this.sink)(ev);
+            // Emit event terminal DULU sebelum memulai item antrian berikutnya.
+            // Sesi yang sudah digantikan sesi baru TIDAK boleh emit: event
+            // Paused/Failed-nya menimpa status baris yang justru sedang jalan
+            // (Resume tampak "Stopped", dan klik Resume me-restart sesi hidup).
+            if owns_entry {
+                let ev = match res {
+                    Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
+                    Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
+                    Err(e) => EngineEvent::Failed { id, error: error_chain(&e) },
+                };
+                (this.sink)(ev);
+            }
             if queued {
                 this.queue.lock().unwrap().running_ids.remove(&id);
                 this.pump();

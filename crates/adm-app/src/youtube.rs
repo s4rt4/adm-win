@@ -285,12 +285,18 @@ pub fn start_as(engine: &EngineHandle, id: u64, req: YtRequest) -> Option<u64> {
     let ytdlp = ytdlp_path()?;
     let ffmpeg = ffmpeg_path()?;
     let dir = engine.download_dir();
-    let token = engine.register(id);
-    // Baris instan dengan nama placeholder (dikoreksi saat judul asli diketahui).
+    let (token, gen) = engine.register(id);
+    // Baris instan. Untuk Resume/Redownload, pertahankan output baris yang
+    // sudah ada — placeholder hanya untuk baris baru. Bila probe judul gagal
+    // (offline/yt-dlp error), jangan tinggalkan baris menunjuk "Video.mp4"
+    // yang tak pernah ada (Open folder/duplikat/hapus-file jadi salah sasaran).
+    let existing = crate::store::get(id)
+        .map(|r| r.output)
+        .filter(|p| p.file_name().is_some());
     engine.emit(EngineEvent::Started {
         id,
         url: req.url.clone(),
-        output: dir.join(hint_name(req.mode)),
+        output: existing.unwrap_or_else(|| dir.join(hint_name(req.mode))),
     });
     // Baris sudah ada di store (sink Started sinkron) → tandai sbg YouTube.
     if req.mode != Mode::Playlist {
@@ -299,19 +305,22 @@ pub fn start_as(engine: &EngineHandle, id: u64, req: YtRequest) -> Option<u64> {
     let eng = engine.clone();
     if std::thread::Builder::new()
         .name(format!("ytdlp-{id}"))
-        .spawn(move || run_job(eng, id, token, ytdlp, ffmpeg, dir, req))
+        .spawn(move || run_job(eng, id, gen, token, ytdlp, ffmpeg, dir, req))
         .is_err()
     {
         // Tanpa worker, baris akan macet "Downloading" selamanya.
-        engine.unregister(id);
-        engine.emit(EngineEvent::Failed { id, error: "Gagal memulai thread yt-dlp".into() });
+        if engine.unregister(id, gen) {
+            engine.emit(EngineEvent::Failed { id, error: "Gagal memulai thread yt-dlp".into() });
+        }
     }
     Some(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     eng: EngineHandle,
     id: u64,
+    gen: u64,
     token: adm_core::CancelToken,
     ytdlp: PathBuf,
     ffmpeg: PathBuf,
@@ -329,11 +338,14 @@ fn run_job(
     }
 
     let outcome = run_download(&eng, id, &token, &ytdlp, &ffmpeg, &dir, &req, known);
-    eng.unregister(id);
-    match outcome {
-        Ok(Done::Completed { bytes }) => eng.emit(EngineEvent::Completed { id, bytes }),
-        Ok(Done::Cancelled { downloaded }) => eng.emit(EngineEvent::Paused { id, downloaded }),
-        Ok(Done::Failed { error }) | Err(error) => eng.emit(EngineEvent::Failed { id, error }),
+    // Sesi yang sudah digantikan (Resume di-klik lagi) tak boleh emit event
+    // terminal — statusnya akan menimpa sesi baru yang sedang jalan.
+    if eng.unregister(id, gen) {
+        match outcome {
+            Ok(Done::Completed { bytes }) => eng.emit(EngineEvent::Completed { id, bytes }),
+            Ok(Done::Cancelled { downloaded }) => eng.emit(EngineEvent::Paused { id, downloaded }),
+            Ok(Done::Failed { error }) | Err(error) => eng.emit(EngineEvent::Failed { id, error }),
+        }
     }
 }
 

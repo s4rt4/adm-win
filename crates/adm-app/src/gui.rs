@@ -191,6 +191,11 @@ pub fn engine() -> Option<EngineHandle> {
 /// mengirim `download.add` 2x untuk satu klik).
 static LAST_ADD: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
 
+/// Titipan `download.add` yang datang sebelum window utama siap (sudah
+/// di-ACK ke bridge — tak boleh hilang); dikuras `drain_pending_adds`.
+/// Beda dengan `PENDING_ADDS` (titipan saat dialog modal terbuka).
+static EARLY_ADDS: Mutex<Vec<DownloadAddParams>> = Mutex::new(Vec::new());
+
 /// Dipanggil dari thread IPC (browser/bridge): titip unduhan ke UI thread untuk
 /// dialog "Download File Info" (tidak langsung mulai). Menunggu window siap.
 pub fn request_add(params: DownloadAddParams) {
@@ -205,13 +210,20 @@ pub fn request_add(params: DownloadAddParams) {
         }
         *last = Some((params.url.clone(), now));
     }
-    for _ in 0..60 {
-        if state::load_hwnd(&state::MAIN_HWND).is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    if let Some(hwnd) = state::load_hwnd(&state::MAIN_HWND) {
+    // Antrikan lalu coba kirim. Jangan sleep-tunggu di sini: fungsi ini jalan
+    // di worker tokio (IPC), dan kami sudah ACK "accepted" ke bridge — params
+    // tak boleh di-drop diam-diam bila window belum siap; drain ulang dipanggil
+    // saat window utama selesai dibuat.
+    EARLY_ADDS.lock().unwrap().push(params);
+    drain_pending_adds();
+}
+
+/// Kirim titipan `download.add` ke UI thread bila window utama sudah ada.
+/// Dipanggil dari `request_add` dan sekali lagi setelah window utama dibuat.
+pub fn drain_pending_adds() {
+    let Some(hwnd) = state::load_hwnd(&state::MAIN_HWND) else { return };
+    let items: Vec<DownloadAddParams> = std::mem::take(&mut *EARLY_ADDS.lock().unwrap());
+    for params in items {
         let ptr = Box::into_raw(Box::new(params));
         unsafe {
             if PostMessageW(Some(hwnd), state::WM_ADD_DOWNLOAD, WPARAM(0), LPARAM(ptr as isize)).is_err() {
@@ -305,6 +317,8 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             None,
         )?;
         state::store_hwnd(&state::MAIN_HWND, hwnd);
+        // Kirim download.add yang sempat datang sebelum window siap.
+        drain_pending_adds();
 
         // Ikon kecil & besar untuk taskbar/titlebar.
         let small = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
@@ -1366,6 +1380,20 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_REMOVE => remove_selected(hwnd, false),
         ID_DELETE => remove_selected(hwnd, true),
         ID_DELETE_COMPLETED => {
+            // Baris playlist juga harus melepas manajernya (MANAGERS) dan opsi
+            // penyelesaiannya — remove_completed hanya membuang row dari store.
+            let ids: Vec<u64> = store::with_rows(|rows| {
+                rows.iter()
+                    .filter(|r| r.status == store::Status::Complete)
+                    .map(|r| r.id)
+                    .collect()
+            });
+            for id in ids {
+                if crate::youtube_playlist::is_playlist(id) {
+                    crate::youtube_playlist::remove(id);
+                }
+                let _ = crate::progress::take_completion_opts(id);
+            }
             store::remove_completed();
             store::save();
             refresh_ui(hwnd);
@@ -1469,7 +1497,10 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         // Tray.
         ID_TRAY_SHOW => toggle_window(hwnd),
         ID_TRAY_AUTOSTART => {
-            let _ = autostart::toggle();
+            // Simpan juga ke settings: lib.rs menyamakan registry dengan
+            // settings.autostart saat start — tanpa ini toggle tray di-revert.
+            let new = autostart::toggle();
+            crate::settings::update(|s| s.autostart = new);
         }
         ID_TRAY_EXIT => request_exit(hwnd),
         m if (ID_MOVE_BASE..ID_MOVE_BASE + 6).contains(&m) => do_move(hwnd, m - ID_MOVE_BASE),
@@ -1528,8 +1559,29 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
             newdir.push(f);
         }
         let _ = std::fs::create_dir_all(&newdir);
-        let newpath = newdir.join(&filename);
-        if newpath != row.output {
+        let mut newpath = newdir.join(&filename);
+        let same = newpath
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&row.output.to_string_lossy());
+        if !same {
+            // Jangan timpa file senama di folder tujuan (rename Windows
+            // me-replace diam-diam) — termasuk bentrok antar-item dalam satu
+            // batch multi-select: beri akhiran " (n)" sampai unik.
+            if newpath.exists() {
+                let (stem, ext) = split_ext(&filename);
+                for n in 1.. {
+                    let cand = if ext.is_empty() {
+                        format!("{stem} ({n})")
+                    } else {
+                        format!("{stem} ({n}).{ext}")
+                    };
+                    let p = newdir.join(&cand);
+                    if !p.exists() {
+                        newpath = p;
+                        break;
+                    }
+                }
+            }
             let _ = std::fs::rename(&row.output, &newpath);
             adm_core::sidecar::rename_for(&row.output, &newpath);
         }
@@ -1957,6 +2009,7 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
     for id in ids {
         if let Some(e) = engine {
             e.cancel(id);
+            e.clear_limit(id); // batas per-unduhan ikut hangus
         }
         // Baris playlist → hentikan & lepas manajernya (+ tutup jendela progres).
         if crate::youtube_playlist::is_playlist(id) {
@@ -2352,6 +2405,10 @@ unsafe fn set_theme(hwnd: HWND, theme: u8) {
     crate::settings::update(|s| s.theme = theme);
     apply_theme(hwnd);
     update_theme_checks();
+    // Dialog modeless yang sedang terbuka ikut ganti tema — tanpa ini dialog
+    // progres/playlist jadi belang (sebagian kontrol lama, sebagian baru).
+    crate::progress::retheme_open();
+    crate::youtube_playlist::retheme_open();
 }
 
 unsafe fn update_theme_checks() {

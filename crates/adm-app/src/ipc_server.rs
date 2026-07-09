@@ -15,9 +15,16 @@ pub async fn serve(engine: EngineHandle) -> std::io::Result<()> {
         .create(PIPE_NAME)?;
 
     loop {
-        server.connect().await?;
+        // Error transien (klien mati saat handshake, dsb.) tidak boleh
+        // mematikan server selamanya: buat ulang instance pipe & lanjut.
+        if let Err(e) = server.connect().await {
+            eprintln!("[ipc] accept gagal: {e}");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            server = recreate_pipe().await;
+            continue;
+        }
         let connected = server;
-        server = ServerOptions::new().create(PIPE_NAME)?;
+        server = recreate_pipe().await;
 
         let engine = engine.clone();
         tokio::spawn(async move {
@@ -25,6 +32,22 @@ pub async fn serve(engine: EngineHandle) -> std::io::Result<()> {
                 eprintln!("[ipc] koneksi berakhir: {e}");
             }
         });
+    }
+}
+
+/// Buat instance pipe berikutnya; coba ulang dengan backoff bila gagal
+/// (mis. kehabisan handle sesaat) — jangan pernah menyerah.
+async fn recreate_pipe() -> NamedPipeServer {
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match ServerOptions::new().create(PIPE_NAME) {
+            Ok(s) => return s,
+            Err(e) => {
+                eprintln!("[ipc] buat pipe gagal: {e}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
     }
 }
 

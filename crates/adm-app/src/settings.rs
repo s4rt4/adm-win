@@ -79,8 +79,10 @@ pub fn update(f: impl FnOnce(&mut Settings)) {
     let mut s = guard.clone().unwrap_or_default();
     f(&mut s);
     *guard = Some(s.clone());
-    drop(guard);
+    // Tulis ke disk selagi memegang lock: dua update() bersamaan tak boleh
+    // saling menimpa file dengan snapshot basi.
     save(&s);
+    drop(guard);
 }
 
 fn save(s: &Settings) {

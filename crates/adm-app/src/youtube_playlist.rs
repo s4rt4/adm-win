@@ -822,6 +822,20 @@ pub fn open_window(parent: HWND, id: u64) {
     }
 }
 
+/// Terapkan ulang tema ke semua jendela progres playlist yang terbuka
+/// (dipanggil saat user mengganti tema selagi jendela tampil).
+pub fn retheme_open() {
+    let hwnds: Vec<isize> = W_OPEN.lock().unwrap().iter().map(|(_, h)| *h).collect();
+    for h in hwnds {
+        unsafe {
+            let hwnd = HWND(h as *mut core::ffi::c_void);
+            if IsWindow(Some(hwnd)).as_bool() {
+                crate::dark::retheme(hwnd);
+            }
+        }
+    }
+}
+
 /// Indeks item (dalam Vec manajer) untuk baris ListView non-Removed.
 fn visible_map(mgr: &Arc<Manager>) -> Vec<usize> {
     mgr.items
