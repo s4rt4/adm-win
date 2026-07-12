@@ -760,15 +760,24 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
     let buf = CreateCompatibleBitmap(hdc, w, h);
     let old = SelectObject(mem, buf.into());
 
-    // Latar trough (abu terang seperti dasar progress bar atas).
-    let bg = CreateSolidBrush(rgb(230, 230, 230));
+    // Warna trough/pending/pemisah ikut tema (gelap: palet One Dark selaras
+    // dark.rs; terang: abu seperti dasar progress bar atas).
+    let dark = crate::dark::is_dark();
+    let (c_trough, c_pending, c_sep) = if dark {
+        (rgb(30, 33, 39), rgb(52, 57, 66), rgb(82, 89, 101))
+    } else {
+        (rgb(230, 230, 230), rgb(214, 214, 214), rgb(150, 150, 150))
+    };
+    let bg = CreateSolidBrush(c_trough);
     FillRect(mem, &rc, bg);
     let _ = DeleteObject(bg.into());
 
     // Tema progress bar = sumber warna hijau & kilau yang sama dengan bar atas.
+    // Window ini sengaja TIDAK di-SetWindowTheme DarkMode (lihat dark.rs):
+    // PP_FILL versi DarkMode digambar putih, versi normal hijau.
     let htheme = OpenThemeData(Some(hwnd), w!("PROGRESS"));
 
-    let pending = CreateSolidBrush(rgb(214, 214, 214));
+    let pending = CreateSolidBrush(c_pending);
     let mut filled_rects: Vec<RECT> = Vec::new();
     let mut downloading = false;
 
@@ -803,7 +812,7 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
                 }
 
                 // Pemisah antar koneksi (tipis & halus).
-                let sep = CreateSolidBrush(rgb(150, 150, 150));
+                let sep = CreateSolidBrush(c_sep);
                 let line = RECT { left: x1 - 1, top: 0, right: x1, bottom: h };
                 FillRect(mem, &line, sep);
                 let _ = DeleteObject(sep.into());

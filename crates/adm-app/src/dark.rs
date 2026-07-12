@@ -20,6 +20,7 @@ const TEXT: (u8, u8, u8) = (171, 178, 191); // #ABB2BF teks
 const HEADER_BG: (u8, u8, u8) = (45, 50, 59); // #2D323B header tabel (sedikit > body)
 const HEADER_SEP: (u8, u8, u8) = (60, 66, 76); // pemisah kolom header (halus)
 const SEL_BG: (u8, u8, u8) = (58, 63, 75); // sorotan item combo/list terpilih
+const PROGRESS_GREEN: (u8, u8, u8) = (6, 176, 37); // hijau progress bar Windows (klasik)
 
 // ID subclass header (arbitrer, unik per kelas subclass).
 const HEADER_SUBCLASS_ID: usize = 0x00AD_0001;
@@ -130,12 +131,26 @@ unsafe extern "system" fn retheme_child(child: HWND, lp: LPARAM) -> BOOL {
 }
 
 unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
-    // DarkMode_Explorer membuat tombol/edit/scrollbar/combo dirender gelap di Win10+.
-    let _ = SetWindowTheme(child, w!("DarkMode_Explorer"), PCWSTR::null());
-    // ListView/TreeView tak menghormati WM_CTLCOLOR → warnai langsung via pesan.
     let mut cls = [0u16; 64];
     let n = GetClassNameW(child, &mut cls);
     let name = String::from_utf16_lossy(&cls[..n as usize]);
+    // Progress bar: PP_FILL versi DarkMode digambar PUTIH (bukan hijau) →
+    // matikan theme dan warnai klasik: trough gelap + bar hijau.
+    if name.eq_ignore_ascii_case("msctls_progress32") {
+        let _ = SetWindowTheme(child, w!(""), w!(""));
+        SendMessageW(child, PBM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(rgb(EDIT_BG).0 as isize)));
+        SendMessageW(child, PBM_SETBARCOLOR, Some(WPARAM(0)), Some(LPARAM(rgb(PROGRESS_GREEN).0 as isize)));
+        return BOOL(1);
+    }
+    // SegmentBar (dialog progres) mengambil hijau dari tema "PROGRESS" milik
+    // window-nya saat paint; biarkan tema default agar tak dapat versi DarkMode
+    // (fill putih). Warna gelap trough-nya diatur sendiri di paint_segbar.
+    if name.eq_ignore_ascii_case("AdmSegmentBar") {
+        return BOOL(1);
+    }
+    // DarkMode_Explorer membuat tombol/edit/scrollbar/combo dirender gelap di Win10+.
+    let _ = SetWindowTheme(child, w!("DarkMode_Explorer"), PCWSTR::null());
+    // ListView/TreeView tak menghormati WM_CTLCOLOR → warnai langsung via pesan.
     let bg = rgb(BG).0 as isize;
     let txt = rgb(TEXT).0 as isize;
     if name.eq_ignore_ascii_case("SysListView32") {
@@ -150,8 +165,129 @@ unsafe extern "system" fn theme_child(child: HWND, _: LPARAM) -> BOOL {
         // Tombol dropdown ▾ combobox tetap putih walau DarkMode_Explorer → subclass
         // untuk meng-overpaint tombol gelap. (Permukaan sudah owner-draw dark.)
         install_combo(child);
+    } else if name.eq_ignore_ascii_case("SysTabControl32") {
+        // Tema DarkMode tak mencakup kelas Tab: pane tetap abu terang → label
+        // di atasnya tampak kotak-kotak. Subclass menggambar tab gelap penuh.
+        install_tab(child);
     }
     BOOL(1)
+}
+
+// ID subclass tab control (unik terhadap subclass lain di modul ini).
+const TAB_SUBCLASS_ID: usize = 0x00AD_0003;
+
+/// Subclass tab control agar digambar gelap penuh (baris tab + pane). Proc
+/// menggating sendiri via `is_dark()` — saat tema terang kembali ke gambar
+/// default, jadi aman dipasang permanen dan dipanggil berulang.
+///
+/// # Safety
+/// `tab` harus handle tab control (`SysTabControl32`) valid.
+pub unsafe fn install_tab(tab: HWND) {
+    let _ = SetWindowSubclass(tab, Some(tab_subclass), TAB_SUBCLASS_ID, 0);
+}
+
+unsafe extern "system" fn tab_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    if is_dark() {
+        match msg {
+            WM_ERASEBKGND => return LRESULT(1),
+            WM_PAINT => {
+                paint_tab_dark(hwnd);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// Gambar tab control gelap: latar & pane BG (menyatu dengan label yang diberi
+/// brush BG via `ctlcolor`), item tab HEADER_BG, item terpilih menyatu dengan
+/// pane, border pane halus HEADER_SEP.
+unsafe fn paint_tab_dark(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    FillRect(hdc, &rc, cached_brush(&BG_BRUSH, BG));
+
+    let font = SendMessageW(hwnd, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    let oldf =
+        (font != 0).then(|| SelectObject(hdc, HGDIOBJ(font as *mut core::ffi::c_void)));
+
+    let count = SendMessageW(hwnd, TCM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    let sel = SendMessageW(hwnd, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+
+    // Tepi bawah baris tab = tepi atas pane.
+    let mut pane_top = rc.top;
+    let mut rects: Vec<RECT> = Vec::with_capacity(count.max(0) as usize);
+    for i in 0..count {
+        let mut ir = RECT::default();
+        SendMessageW(
+            hwnd,
+            TCM_GETITEMRECT,
+            Some(WPARAM(i as usize)),
+            Some(LPARAM(&mut ir as *mut _ as isize)),
+        );
+        pane_top = pane_top.max(ir.bottom);
+        rects.push(ir);
+    }
+
+    // Border pane 1px.
+    let sep = CreateSolidBrush(rgb(HEADER_SEP));
+    let pane = RECT { left: rc.left, top: pane_top, right: rc.right, bottom: rc.bottom };
+    FrameRect(hdc, &pane, sep);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, rgb(TEXT));
+    for (i, ir) in rects.iter().enumerate() {
+        if i as isize == sel {
+            // Item terpilih: isi BG hingga menutup border pane di bawahnya
+            // (tampak menyatu dengan pane) + garis tepi kiri/atas/kanan.
+            let r = RECT { left: ir.left, top: ir.top, right: ir.right, bottom: pane_top + 1 };
+            FillRect(hdc, &r, cached_brush(&BG_BRUSH, BG));
+            for e in [
+                RECT { left: r.left, top: r.top, right: r.left + 1, bottom: pane_top },
+                RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + 1 },
+                RECT { left: r.right - 1, top: r.top, right: r.right, bottom: pane_top },
+            ] {
+                FillRect(hdc, &e, sep);
+            }
+        } else {
+            let b = CreateSolidBrush(rgb(HEADER_BG));
+            FillRect(hdc, ir, b);
+            let _ = DeleteObject(b.into());
+        }
+        let mut buf = [0u16; 96];
+        let mut item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: PWSTR(buf.as_mut_ptr()),
+            cchTextMax: buf.len() as i32,
+            ..Default::default()
+        };
+        SendMessageW(
+            hwnd,
+            TCM_GETITEMW,
+            Some(WPARAM(i)),
+            Some(LPARAM(&mut item as *mut _ as isize)),
+        );
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let mut wide: Vec<u16> = buf[..len].to_vec();
+        let mut tr = *ir;
+        DrawTextW(hdc, &mut wide, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    let _ = DeleteObject(sep.into());
+
+    if let Some(of) = oldf {
+        SelectObject(hdc, of);
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// Tangani `WM_CTLCOLOR*` (STATIC/EDIT/BTN/LISTBOX/DLG/SCROLLBAR). Kembalikan
