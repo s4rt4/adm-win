@@ -28,4 +28,9 @@ target\debug\adm-bridge.exe unregister
 - Registry yang ditulis: `HKCU\Software\{Google\Chrome|Microsoft\Edge|Mozilla}\NativeMessagingHosts\com.adm.bridge` → path manifest.
 - Manifest Chrome/Edge memakai `allowed_origins` (chrome-extension://ID/); Firefox memakai `allowed_extensions`.
 - Di rilis, installer (WiX/Inno, §11.2) yang menulis registry + manifest; langkah `register` manual ini untuk development.
-- Extension ID unpacked bisa dibuat stabil dengan menambah field `key` di `manifest.json` (opsional).
+- Extension ID kini STABIL: `cjamijdkchdmdocnpdbjobcnmagdjcfe` (field `key` di `manifest.json`;
+  private key di `secrets/adm-extension-key.pem`, di-gitignore — JANGAN hilang/bocor, dipakai lagi
+  bila kelak publish ke Chrome Web Store agar ID tetap sama).
+- Installer rilis: `tools\make-installer.ps1` → `dist\ADM-Setup-<versi>.exe` (Inno Setup 6).
+  Installer menyalin app+sidecar+folder `extension\` ke `%LOCALAPPDATA%\ADM`, lalu otomatis
+  `register` ID stabil di atas. Uninstall menjalankan `unregister`.

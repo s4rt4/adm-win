@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx+UYvLLGrJCqnrZX7EImF8YSm9/L8tTVADS/sJicGdxBSspOUFzJVIYRksYqA/IuScOuQO+snPZThzdvO5U5NIgwZ7eqefjiMneOr0UkxdizXjXr8W1fivSJ3451pFat96RFR6NEsbM4CFLPRQ0a+gS6KnRwlMESPYoOjvT3omdu7Q/tMdTcAiDiG40W1Au7CaVdSSHQBiKEldwvHsGBNV/tjZ85U9u1BLOZIRnXO5vWcD24aUHO7cG14lWtFsQAbj2gzsI8wKpcGybtcnm/a1DODtkAkMIFymIgKDh8nS1KUOfTUNC0feMwMjf/PKS+OcQCutRg1QLk48IihexmxwIDAQAB",
   "name": "Alpha Download Manager Integration",
   "version": "0.1.0",
   "description": "Tangkap unduhan browser dan kirim ke Alpha Download Manager (ADM).",

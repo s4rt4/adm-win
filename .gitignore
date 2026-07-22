@@ -1,5 +1,7 @@
 target/
 **/*.rs.bk
+secrets/
+dist/
 Cargo.lock.bak
 *.pdb
 

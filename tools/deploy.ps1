@@ -3,7 +3,7 @@
 #   -Build        : jalankan 'cargo build --release' dulu sebelum menyalin.
 #   -ExtensionId  : ID extension Chrome/Edge (default = ID unpacked saat ini).
 param(
-    [string]$ExtensionId = "jdgkcdnbhdjkahjfeadeplbdinabncci",
+    [string]$ExtensionId = "cjamijdkchdmdocnpdbjobcnmagdjcfe",
     [switch]$Build
 )
 

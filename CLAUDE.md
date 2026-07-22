@@ -9,4 +9,5 @@
 ## Folder target
 
 - Folder `target` aman di-`cargo clean` / dihapus kapan saja — jangan andalkan `target\release` sebagai lokasi exe yang dipakai.
+- Installer rilis: `powershell -ExecutionPolicy Bypass -File tools\make-installer.ps1` → `dist\ADM-Setup-<versi>.exe` (butuh Inno Setup 6; sidecar diambil dari `target\release` atau fallback `AppData\Local\ADM`). Extension ID stabil `cjamijdkchdmdocnpdbjobcnmagdjcfe` via field `key` (private key: `secrets\adm-extension-key.pem`, di-gitignore, jangan hilang).
 - Setelah build rilis baru: jalankan `powershell -ExecutionPolicy Bypass -File tools\deploy.ps1` — menyalin `adm-app.exe` + `adm-bridge.exe` (dan sidecar jika berubah) ke `AppData\Local\ADM\`, lalu otomatis `register` ulang native messaging host dari exe AppData. Jangan salin manual tanpa register: registry native host pernah putus karena masih menunjuk manifest di `target\release` yang kena `cargo clean` (ekstensi mencegat download tapi tidak masuk ADM).
