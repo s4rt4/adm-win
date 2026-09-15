@@ -14,7 +14,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // (label resolusi, tinggi) untuk combo playlist.
@@ -925,19 +925,35 @@ static W_REG: AtomicBool = AtomicBool::new(false);
 static W_OPEN: Mutex<Vec<(u64, isize)>> = Mutex::new(Vec::new());
 const W_TIMER: usize = 1;
 
-const WID_LIST: usize = 1;
-const WID_RESUME: usize = 2;
-const WID_DELETE: usize = 3;
-const WID_STOP: usize = 4;
-const WID_CLOSE: usize = 5;
+// ID kontrol sengaja mulai dari 100: `IsDialogMessageW` mengubah Enter/Esc jadi
+// WM_COMMAND IDOK(1)/IDCANCEL(2), jadi ID kontrol tak boleh bertabrakan dengan
+// keduanya (dulu WID_LIST=1 dan WID_RESUME=2 → Esc = "Resume selected").
+const WID_LIST: usize = 101;
+const WID_RESUME: usize = 102;
+const WID_DELETE: usize = 103;
+const WID_STOP: usize = 104;
+const WID_CLOSE: usize = 105;
 
 struct WinData {
     id: u64,
+    /// Manajer di-cache: custom-draw dipanggil per SEL, dan `manager_of` di sana
+    /// berarti kunci MANAGERS + clone Arc ratusan kali tiap repaint.
+    mgr: Arc<Manager>,
     list: HWND,
     bar: HWND,
     lbl: HWND,
     /// jumlah baris tampil terakhir (untuk deteksi perlu rebuild).
     shown: usize,
+    /// Teks sel terakhir yang ditulis per baris (Title, Status, Speed, Progress)
+    /// — `LVM_SETITEMTEXT` selalu meng-invalidate subitem walau teksnya sama,
+    /// jadi tanpa cache ini seluruh list repaint tiap tick timer.
+    cells: Vec<[String; 4]>,
+    /// Nilai terakhir bar + label agregat (hindari repaint sia-sia).
+    last_bar: usize,
+    last_lbl: String,
+    /// Status enable terakhir [Resume, Delete, Stop] — tombol yang mati
+    /// memberi tahu user KENAPA klik tak berefek (mis. belum ada seleksi).
+    last_btn: [bool; 3],
 }
 
 unsafe fn win_data(hwnd: HWND) -> Option<&'static mut WinData> {
@@ -971,7 +987,9 @@ pub fn open_window(parent: HWND, id: u64) {
         }
 
         let title = HSTRING::from(format!("Playlist: {}", mgr.name));
-        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+        // WS_CLIPCHILDREN: tanpa ini latar (WM_ERASEBKGND, apalagi dark mode)
+        // menimpa tombol tiap repaint → tombol berkedip & terasa tak merespons.
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
         let mut rc = RECT { left: 0, top: 0, right: 640, bottom: 440 };
         let _ = AdjustWindowRectEx(&mut rc, style, false, WINDOW_EX_STYLE::default());
         let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -1003,12 +1021,23 @@ pub fn open_window(parent: HWND, id: u64) {
         SendMessageW(bar, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(1000)));
         let lbl = mk(dlg, w!("STATIC"), w!(""), WINDOW_STYLE(0), 520, 342, 94, 16, 0);
 
-        let _ = mk(dlg, w!("BUTTON"), w!("Resume selected"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 10, 372, 130, 30, WID_RESUME);
+        let _ = mk(dlg, w!("BUTTON"), w!("Resume"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 10, 372, 130, 30, WID_RESUME);
         let _ = mk(dlg, w!("BUTTON"), w!("Delete selected"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 148, 372, 130, 30, WID_DELETE);
         let _ = mk(dlg, w!("BUTTON"), w!("Stop all"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 286, 372, 100, 30, WID_STOP);
         let _ = mk(dlg, w!("BUTTON"), w!("Close"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 514, 372, 100, 30, WID_CLOSE);
 
-        let data = Box::new(WinData { id, list, bar, lbl, shown: usize::MAX });
+        let data = Box::new(WinData {
+            id,
+            mgr,
+            list,
+            bar,
+            lbl,
+            shown: usize::MAX,
+            cells: Vec::new(),
+            last_bar: usize::MAX,
+            last_lbl: String::new(),
+            last_btn: [true; 3],
+        });
         SetWindowLongPtrW(dlg, GWLP_USERDATA, Box::into_raw(data) as isize);
         W_OPEN.lock().unwrap().push((id, dlg.0 as isize));
 
@@ -1017,6 +1046,37 @@ pub fn open_window(parent: HWND, id: u64) {
         SetTimer(Some(dlg), W_TIMER, 500, None);
         crate::dark::apply(dlg);
         let _ = ShowWindow(dlg, SW_SHOW);
+        // Tanpa fokus awal, keyboard tak mengenai kontrol mana pun: Tab/Enter/
+        // spasi tak melakukan apa-apa sampai user mengklik sesuatu.
+        let _ = SetFocus(Some(list));
+    }
+}
+
+/// Saring pesan milik jendela progres playlist dari message loop utama.
+/// Mengembalikan true bila pesan sudah ditangani di sini — pemanggil HARUS
+/// melewati akselerator global.
+///
+/// Dua hal diperbaiki sekaligus:
+/// * Jendela ini modeless dan bukan dialog, jadi tanpa `IsDialogMessageW` tak
+///   ada navigasi Tab, tak ada Enter/Esc, dan tombol hanya bereaksi ke mouse.
+/// * Tabel akselerator window utama (Del=Remove, Ctrl+N/F, F3, Ctrl+Q) berlaku
+///   untuk SELURUH pesan thread. Menekan Del di sini dulu malah menghapus baris
+///   di list utama, bukan item playlist yang dipilih.
+pub fn pre_translate(msg: &MSG) -> bool {
+    unsafe {
+        if msg.hwnd.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(msg.hwnd, GA_ROOT);
+        let mine = W_OPEN.lock().unwrap().iter().any(|(_, h)| *h == root.0 as isize);
+        if !mine {
+            return false;
+        }
+        if !IsDialogMessageW(root, msg).as_bool() {
+            let _ = TranslateMessage(msg);
+            DispatchMessageW(msg);
+        }
+        true
     }
 }
 
@@ -1085,10 +1145,12 @@ unsafe fn w_layout(hwnd: HWND) {
 
 unsafe fn w_refresh(hwnd: HWND) {
     let Some(d) = win_data(hwnd) else { return };
-    let Some(mgr) = manager_of(d.id) else {
+    // Manajer sudah dilepas (baris playlist dihapus dari list utama) → tutup.
+    if !is_playlist(d.id) {
         let _ = DestroyWindow(hwnd);
         return;
-    };
+    }
+    let mgr = d.mgr.clone();
     let map = visible_map(&mgr);
     // Rebuild bila jumlah baris berubah (mis. ada yang dihapus).
     if map.len() != d.shown {
@@ -1105,43 +1167,101 @@ unsafe fn w_refresh(hwnd: HWND) {
             SendMessageW(d.list, LVM_INSERTITEMW, Some(WPARAM(0)), Some(LPARAM(&mut lvi as *mut _ as isize)));
         }
         d.shown = map.len();
+        d.cells = vec![<[String; 4]>::default(); map.len()];
     }
 
-    let items = mgr.items.lock().unwrap();
-    let (mut done, total) = (0usize, map.len());
-    for (row, &item_idx) in map.iter().enumerate() {
-        let Some(it) = items.get(item_idx) else { continue };
-        lv_set(d.list, row as i32, 1, &it.title);
-        lv_set(d.list, row as i32, 2, it.status.label());
-        // Kecepatan (hanya saat mengunduh).
-        let speed = if it.status == ItemStatus::Downloading && it.speed > 0 {
-            fmt_speed(it.speed)
-        } else {
-            String::new()
-        };
-        lv_set(d.list, row as i32, 3, &speed);
-        // Progress: teks fallback; untuk Downloading (total diketahui) bar+persen
-        // digambar via custom-draw menimpa teks ini.
-        let prog = match it.status {
-            ItemStatus::Downloading => match it.total {
-                Some(t) if t > 0 => format!("{}%", (it.downloaded.saturating_mul(100) / t).min(100)),
-                _ => youtube::fmt_mb(it.downloaded),
-            },
-            ItemStatus::Done => it.total.map(youtube::fmt_mb).unwrap_or_default(),
-            ItemStatus::Error => trunc(&it.error, 40),
-            ItemStatus::Pending | ItemStatus::Stopped => "-".into(),
-            ItemStatus::Removed => String::new(),
-        };
-        lv_set(d.list, row as i32, 4, &prog);
-        if it.status == ItemStatus::Done {
-            done += 1;
+    // Rakit seluruh teks sel SELAGI memegang lock, lalu lepaskan sebelum
+    // menyentuh ListView: `pl_customdraw` juga mengunci `items`, jadi mengirim
+    // pesan ke list sambil memegang lock itu adalah deadlock yang menunggu
+    // terjadi (cukup satu repaint sinkron).
+    let (rows, done, total, resumable, running) = {
+        let items = mgr.items.lock().unwrap();
+        let mut rows: Vec<[String; 4]> = Vec::with_capacity(map.len());
+        let (mut done, mut resumable, mut running) = (0usize, false, false);
+        for &item_idx in &map {
+            let Some(it) = items.get(item_idx) else {
+                rows.push(Default::default());
+                continue;
+            };
+            // Kecepatan (hanya saat mengunduh).
+            let speed = if it.status == ItemStatus::Downloading && it.speed > 0 {
+                fmt_speed(it.speed)
+            } else {
+                String::new()
+            };
+            // Progress: teks fallback; untuk Downloading (total diketahui)
+            // bar+persen digambar via custom-draw menimpa teks ini.
+            let prog = match it.status {
+                ItemStatus::Downloading => match it.total {
+                    Some(t) if t > 0 => format!("{}%", (it.downloaded.saturating_mul(100) / t).min(100)),
+                    _ => youtube::fmt_mb(it.downloaded),
+                },
+                ItemStatus::Done => it.total.map(youtube::fmt_mb).unwrap_or_default(),
+                ItemStatus::Error => trunc(&it.error, 40),
+                ItemStatus::Pending | ItemStatus::Stopped => "-".into(),
+                ItemStatus::Removed => String::new(),
+            };
+            match it.status {
+                ItemStatus::Done => done += 1,
+                ItemStatus::Downloading => running = true,
+                ItemStatus::Pending | ItemStatus::Stopped | ItemStatus::Error => resumable = true,
+                ItemStatus::Removed => {}
+            }
+            rows.push([it.title.clone(), it.status.label().to_string(), speed, prog]);
+        }
+        let paused = mgr.paused.load(Ordering::SeqCst);
+        (rows, done, map.len(), resumable, running || !paused)
+    };
+
+    // Tulis HANYA sel yang berubah. `LVM_SETITEMTEXT` selalu meng-invalidate
+    // subitem-nya walau teks identik, jadi menulis semuanya tiap 500 ms berarti
+    // seluruh list (plus custom-draw per sel) repaint dua kali per detik — pada
+    // playlist panjang UI jadi berat dan tombol terasa lambat/tak merespons.
+    for (row, next) in rows.iter().enumerate() {
+        let Some(prev) = d.cells.get_mut(row) else { continue };
+        for c in 0..4 {
+            if prev[c] != next[c] {
+                lv_set(d.list, row as i32, c as i32 + 1, &next[c]);
+                prev[c].clone_from(&next[c]);
+            }
         }
     }
-    drop(items);
+
+    // Status tombol. Sebelumnya semuanya selalu aktif, jadi mengklik "Resume"/
+    // "Delete" tanpa baris terpilih benar-benar tak melakukan apa pun — persis
+    // terasa seperti tombol yang tidak merespons. Sekarang tombol yang tak bisa
+    // dipakai tampak mati.
+    let sel = SendMessageW(d.list, LVM_GETSELECTEDCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    let want = [resumable, sel > 0, running];
+    for (i, (&on, id)) in want
+        .iter()
+        .zip([WID_RESUME, WID_DELETE, WID_STOP])
+        .enumerate()
+    {
+        if d.last_btn[i] != on {
+            if let Ok(b) = GetDlgItem(Some(hwnd), id as i32) {
+                // Menonaktifkan kontrol yang sedang fokus membuang fokus ke
+                // "tak ke mana-mana" — keyboard mati total sampai user mengklik
+                // lagi. Pindahkan dulu ke list.
+                if !on && GetFocus() == b {
+                    let _ = SetFocus(Some(d.list));
+                }
+                let _ = EnableWindow(b, on);
+            }
+            d.last_btn[i] = on;
+        }
+    }
 
     let permille = (done * 1000).checked_div(total).unwrap_or(0);
-    SendMessageW(d.bar, PBM_SETPOS, Some(WPARAM(permille)), Some(LPARAM(0)));
-    set_text(d.lbl, &format!("{done} / {total} done"));
+    if permille != d.last_bar {
+        SendMessageW(d.bar, PBM_SETPOS, Some(WPARAM(permille)), Some(LPARAM(0)));
+        d.last_bar = permille;
+    }
+    let lbl = format!("{done} / {total} done");
+    if lbl != d.last_lbl {
+        set_text(d.lbl, &lbl);
+        d.last_lbl = lbl;
+    }
 }
 
 const COL_PROGRESS: i32 = 4;
@@ -1174,10 +1294,9 @@ unsafe fn pl_customdraw(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         return dodefault;
     }
     let Some(d) = win_data(hwnd) else { return dodefault };
-    let Some(mgr) = manager_of(d.id) else { return dodefault };
     let item_idx = p.nmcd.lItemlParam.0 as usize;
     let (dl, total, downloading) = {
-        let items = mgr.items.lock().unwrap();
+        let items = d.mgr.items.lock().unwrap();
         match items.get(item_idx) {
             Some(it) => (it.downloaded, it.total, it.status == ItemStatus::Downloading),
             None => return dodefault,
@@ -1265,27 +1384,37 @@ extern "system" fn w_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
-                if let Some(d) = win_data(hwnd) {
-                    if let Some(mgr) = manager_of(d.id) {
-                        match id {
-                            WID_RESUME => {
-                                let sel = selected_item_indices(d.list);
-                                resume_items(&mgr, &sel);
-                            }
-                            WID_DELETE => {
-                                let sel = selected_item_indices(d.list);
-                                delete_items(&mgr, &sel);
-                                d.shown = usize::MAX; // paksa rebuild
-                            }
-                            WID_STOP => pause(d.id),
-                            WID_CLOSE => {
-                                let _ = DestroyWindow(hwnd);
-                            }
-                            _ => {}
-                        }
-                        w_refresh(hwnd);
-                    }
+                // Esc (IsDialogMessageW → IDCANCEL) menutup; Enter (IDOK)
+                // menjalankan aksi utama, sama seperti tombol Resume.
+                if id == IDCANCEL.0 as usize || id == WID_CLOSE {
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
                 }
+                let Some(d) = win_data(hwnd) else { return LRESULT(0) };
+                let mgr = d.mgr.clone();
+                match id {
+                    WID_RESUME | 1 /* IDOK */ => {
+                        let sel = selected_item_indices(d.list);
+                        // Tanpa seleksi, Resume di jendela ini tak pernah
+                        // melakukan apa pun — user mengira tombolnya rusak.
+                        // Kosong = lanjutkan semua yang belum selesai.
+                        if sel.is_empty() {
+                            resume_all(d.id);
+                        } else {
+                            resume_items(&mgr, &sel);
+                        }
+                    }
+                    WID_DELETE => {
+                        let sel = selected_item_indices(d.list);
+                        if !sel.is_empty() {
+                            delete_items(&mgr, &sel);
+                            d.shown = usize::MAX; // paksa rebuild
+                        }
+                    }
+                    WID_STOP => pause(d.id),
+                    _ => return LRESULT(0),
+                }
+                w_refresh(hwnd);
                 LRESULT(0)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {

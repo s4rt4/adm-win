@@ -355,6 +355,12 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            // Jendela progres playlist modeless: butuh navigasi dialog sendiri,
+            // dan akselerator di atas TIDAK boleh membajak tombolnya (Del di
+            // sana dulu menghapus baris list utama).
+            if crate::youtube_playlist::pre_translate(&message) {
+                continue;
+            }
             if TranslateAcceleratorW(hwnd, haccel, &message) == 0 {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
