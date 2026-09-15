@@ -104,6 +104,10 @@ pub fn run() {
             );
         }
     });
+    // Pulihkan manajer playlist (item + folder + resolusi) agar baris agregat
+    // tetap dikenali sebagai playlist setelah restart — tanpa ini Resume salah
+    // rute ke dialog unduhan tunggal. Harus SETELAH store::load.
+    youtube_playlist::restore(&engine);
     store::start_saver(); // thread penyimpan daftar (debounce, non-blocking)
     gui::set_engine(engine.clone());
     scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)

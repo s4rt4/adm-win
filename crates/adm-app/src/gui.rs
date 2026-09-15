@@ -1327,8 +1327,10 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if let Some(e) = ENGINE.get() {
                 let ids = selected_ids();
                 for id in &ids {
-                    // Baris playlist → buka jendela progresnya (resume per-item di sana).
-                    if crate::youtube_playlist::is_playlist(*id) {
+                    // Baris playlist → lanjutkan semua video yang belum selesai,
+                    // lalu tampilkan jendela progres playlist (bukan dialog
+                    // unduhan tunggal — URL barisnya cuma label "Playlist: X").
+                    if crate::youtube_playlist::resume_all(*id) {
                         crate::youtube_playlist::open_window(hwnd, *id);
                         continue;
                     }
@@ -1878,6 +1880,12 @@ unsafe fn find_from(hwnd: HWND, start: i32) {
 /// URL — lihat `Sidecar::is_compatible`). Nama berkas lama dipertahankan agar
 /// data parsial dipakai, bukan mulai dari awal.
 unsafe fn do_refresh_link(hwnd: HWND, id: u64) {
+    // Baris agregat playlist tak punya URL sungguhan ("Playlist: X") — link
+    // segar diurus per video di jendela playlist.
+    if crate::youtube_playlist::is_playlist(id) {
+        crate::youtube_playlist::open_window(hwnd, id);
+        return;
+    }
     let Some(row) = store::get(id) else { return };
     let Some(e) = ENGINE.get() else { return };
     let prompt = crate::tasks::prompt_dialog(
@@ -1962,6 +1970,13 @@ unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
 /// hapus berkas hasil + sidecar `.adm` agar tidak resume, lalu mulai lagi.
 unsafe fn do_redownload(hwnd: HWND) {
     let Some(id) = selected_id() else { return };
+    // Baris agregat playlist: `output`-nya folder dan `url`-nya cuma label —
+    // hapus-berkas + resume HTTP di bawah akan salah sasaran. Unduh ulang
+    // per video dilakukan dari jendela playlist.
+    if crate::youtube_playlist::is_playlist(id) {
+        crate::youtube_playlist::open_window(hwnd, id);
+        return;
+    }
     let Some(row) = store::get(id) else { return };
     let Some(e) = ENGINE.get() else { return };
     e.cancel(id); // no-op bila tidak aktif

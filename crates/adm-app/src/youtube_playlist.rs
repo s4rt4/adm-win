@@ -5,6 +5,7 @@
 
 use crate::engine::{EngineEvent, EngineHandle};
 use crate::youtube::{self, Mode, PlEntry, YtRequest};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +30,7 @@ const RESOLUTIONS: [(&str, Option<u32>); 7] = [
 
 // ============================ Model & manajer ============================
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ItemStatus {
     Pending,
     Downloading,
@@ -102,17 +103,21 @@ pub fn is_playlist(id: u64) -> bool {
 pub fn pause(id: u64) {
     if let Some(m) = manager_of(id) {
         m.paused.store(true, Ordering::SeqCst);
-        for it in m.items.lock().unwrap().iter_mut() {
-            match it.status {
-                ItemStatus::Downloading => {
-                    it.cancel.cancel(); // bunuh proses; run_item menandai Stopped
-                    it.status = ItemStatus::Stopped;
-                    it.speed = 0;
+        {
+            let mut items = m.items.lock().unwrap();
+            for it in items.iter_mut() {
+                match it.status {
+                    ItemStatus::Downloading => {
+                        it.cancel.cancel(); // bunuh proses; run_item menandai Stopped
+                        it.status = ItemStatus::Stopped;
+                        it.speed = 0;
+                    }
+                    ItemStatus::Pending => it.status = ItemStatus::Stopped,
+                    _ => {}
                 }
-                ItemStatus::Pending => it.status = ItemStatus::Stopped,
-                _ => {}
             }
         }
+        save_state();
     }
 }
 
@@ -128,6 +133,178 @@ pub fn pause_all() {
 pub fn remove(id: u64) {
     pause(id);
     MANAGERS.lock().unwrap().retain(|m| m.id != id);
+    save_state();
+}
+
+// ========================= Persistensi state playlist =========================
+//
+// Manajer playlist hanya hidup di memori (MANAGERS). Tanpa persistensi, setelah
+// app ditutup baris agregat di list utama kehilangan identitas playlist-nya:
+// `is_playlist` jadi false, sehingga Resume salah rute ke dialog unduhan tunggal
+// dan mencoba mengunduh URL palsu "Playlist: X". State ditulis ke
+// %APPDATA%\ADM\playlists.json dan dipulihkan saat startup oleh `restore`.
+
+#[derive(Serialize, Deserialize)]
+struct SavedItem {
+    url: String,
+    title: String,
+    status: ItemStatus,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    downloaded: u64,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedPlaylist {
+    id: u64,
+    name: String,
+    folder: PathBuf,
+    height: Option<u32>,
+    items: Vec<SavedItem>,
+}
+
+fn state_file() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("ADM").join("playlists.json")
+}
+
+/// Serialisasi penulisan berkas (bisa dipicu worker playlist & UI bersamaan).
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Tulis state semua manajer ke disk (atomik: tmp + rename). Dipanggil hanya
+/// pada transisi status (mulai/selesai item, pause, resume, delete) — jarang,
+/// jadi sinkron aman; progres per-byte sengaja tidak memicu tulis.
+///
+/// PENTING: jangan panggil selagi memegang `Manager::items` — fungsi ini
+/// mengunci MANAGERS lalu items tiap manajer.
+fn save_state() {
+    let snapshot: Vec<SavedPlaylist> = {
+        let mgrs = MANAGERS.lock().unwrap();
+        mgrs.iter()
+            .map(|m| SavedPlaylist {
+                id: m.id,
+                name: m.name.clone(),
+                folder: m.folder.clone(),
+                height: m.height,
+                items: m
+                    .items
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|it| SavedItem {
+                        url: it.url.clone(),
+                        title: it.title.clone(),
+                        // Proses yt-dlp mati saat app ditutup → item yang sedang
+                        // jalan dipersist sebagai Stopped (resumable), bukan
+                        // Downloading yang menyesatkan setelah restart.
+                        status: if it.status == ItemStatus::Downloading {
+                            ItemStatus::Stopped
+                        } else {
+                            it.status
+                        },
+                        error: it.error.clone(),
+                        downloaded: it.downloaded,
+                        total: it.total,
+                        output: it.output.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+    let _guard = SAVE_LOCK.lock().unwrap();
+    let file = state_file();
+    if snapshot.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&snapshot) {
+        let tmp = file.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+}
+
+/// Pulihkan manajer playlist dari disk saat startup. Baris agregatnya sendiri
+/// sudah dimuat oleh `store::load`; ini mengembalikan identitas playlist-nya
+/// agar Resume membuka jendela playlist dan melanjutkan video yang belum
+/// selesai. Semua manajer dipulihkan dalam keadaan dijeda — user yang memulai.
+pub fn restore(engine: &EngineHandle) {
+    let Ok(bytes) = std::fs::read(state_file()) else { return };
+    let Ok(saved) = serde_json::from_slice::<Vec<SavedPlaylist>>(&bytes) else { return };
+    // Biner bisa saja absen (sidecar hilang); manajer tetap dipulihkan supaya
+    // routing Resume benar — kegagalan menjalankan yt-dlp tampil per item.
+    let ytdlp = youtube::ytdlp_path().unwrap_or_default();
+    let ffmpeg = youtube::ffmpeg_path().unwrap_or_default();
+    let mut restored = false;
+    {
+        let mut mgrs = MANAGERS.lock().unwrap();
+        for sp in saved {
+            // Baris agregat sudah tak ada di daftar (dihapus user) → buang.
+            if crate::store::get(sp.id).is_none() || mgrs.iter().any(|m| m.id == sp.id) {
+                continue;
+            }
+            let items: Vec<Item> = sp
+                .items
+                .into_iter()
+                .map(|s| Item {
+                    url: s.url,
+                    title: s.title,
+                    status: if s.status == ItemStatus::Downloading {
+                        ItemStatus::Stopped
+                    } else {
+                        s.status
+                    },
+                    error: s.error,
+                    downloaded: s.downloaded,
+                    total: s.total,
+                    speed: 0,
+                    output: s.output,
+                    cancel: adm_core::CancelToken::new(),
+                })
+                .collect();
+            mgrs.push(Arc::new(Manager {
+                id: sp.id,
+                name: sp.name,
+                folder: sp.folder,
+                height: sp.height,
+                ytdlp: ytdlp.clone(),
+                ffmpeg: ffmpeg.clone(),
+                engine: engine.clone(),
+                items: Mutex::new(items),
+                paused: AtomicBool::new(true),
+                worker_active: AtomicBool::new(false),
+            }));
+            restored = true;
+        }
+    }
+    // Buang entri basi (baris yang sudah dihapus user) dari berkas; bila tak ada
+    // satu pun yang tersisa, `save_state` menghapus berkasnya.
+    save_state();
+    if restored {
+        // Selaraskan teks "(done/total)" baris agregat dengan item yang ada.
+        let mgrs: Vec<Arc<Manager>> = MANAGERS.lock().unwrap().clone();
+        for m in &mgrs {
+            let (done, total) = {
+                let items = m.items.lock().unwrap();
+                let active: Vec<&Item> =
+                    items.iter().filter(|it| it.status != ItemStatus::Removed).collect();
+                (
+                    active.iter().filter(|it| it.status == ItemStatus::Done).count(),
+                    active.len(),
+                )
+            };
+            crate::store::set_name(m.id, &format!("Playlist: {} ({done}/{total})", m.name));
+        }
+    }
 }
 
 /// Mulai unduhan playlist; kembalikan id baris agregat. `None` bila biner absen.
@@ -175,6 +352,7 @@ pub fn start(engine: &EngineHandle, job: PlaylistJob) -> Option<u64> {
     crate::store::set_name(id, &format!("Playlist: {} (0/{total})", job.name));
     crate::state::post_to_ui(crate::state::WM_PROGRESS);
 
+    save_state();
     ensure_worker(&mgr);
     Some(id)
 }
@@ -294,6 +472,8 @@ fn run_item(mgr: &Arc<Manager>, idx: usize) {
             it.error = s.error;
         }
     }
+    drop(items);
+    save_state();
 }
 
 /// Ringkas status ke baris agregat list utama.
@@ -348,6 +528,7 @@ fn finalize(mgr: &Arc<Manager>) {
         // Semua Removed → tandai selesai (kosong).
         mgr.engine.emit(EngineEvent::Completed { id: mgr.id, bytes: 0 });
     }
+    save_state();
     crate::state::post_to_ui(crate::state::WM_PROGRESS);
 }
 
@@ -367,29 +548,46 @@ fn resume_items(mgr: &Arc<Manager>, item_indices: &[usize]) {
         }
     }
     mgr.paused.store(false, Ordering::SeqCst);
+    save_state();
     ensure_worker(mgr);
 }
 
-/// Resume SEMUA item Error/Stopped (dipakai dari list utama).
-pub fn resume_all(id: u64) {
-    if let Some(mgr) = manager_of(id) {
-        let all: Vec<usize> = mgr.items.lock().unwrap().iter().enumerate()
-            .filter(|(_, it)| matches!(it.status, ItemStatus::Error | ItemStatus::Stopped))
-            .map(|(i, _)| i)
-            .collect();
-        resume_items(&mgr, &all);
-    }
+/// Resume SEMUA item yang belum selesai (dipakai dari list utama).
+/// Pending ikut disertakan: setelah restart manajer dipulihkan dalam keadaan
+/// dijeda tanpa worker, jadi item Pending pun perlu dibangunkan.
+/// Mengembalikan false bila `id` bukan baris playlist.
+pub fn resume_all(id: u64) -> bool {
+    let Some(mgr) = manager_of(id) else { return false };
+    let all: Vec<usize> = mgr
+        .items
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| {
+            matches!(
+                it.status,
+                ItemStatus::Error | ItemStatus::Stopped | ItemStatus::Pending
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    resume_items(&mgr, &all);
+    true
 }
 
 /// Tandai item terpilih Removed (batalkan bila sedang jalan).
 fn delete_items(mgr: &Arc<Manager>, item_indices: &[usize]) {
-    let mut items = mgr.items.lock().unwrap();
-    for &i in item_indices {
-        if let Some(it) = items.get_mut(i) {
-            it.status = ItemStatus::Removed;
-            it.cancel.cancel();
+    {
+        let mut items = mgr.items.lock().unwrap();
+        for &i in item_indices {
+            if let Some(it) = items.get_mut(i) {
+                it.status = ItemStatus::Removed;
+                it.cancel.cancel();
+            }
         }
     }
+    save_state();
 }
 
 // ============================ Dialog checklist ============================
