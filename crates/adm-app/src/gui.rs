@@ -2794,18 +2794,80 @@ fn show_window(hwnd: HWND) {
 
 /// Bawa jendela benar-benar ke depan meski proses lain (browser) sedang
 /// foreground — Windows menolak SetForegroundWindow langsung & hanya mengedip
-/// taskbar. Trik: tempel input-thread foreground sesaat agar diizinkan.
-unsafe fn force_foreground(hwnd: HWND) {
+/// taskbar. Tiga lapis: (1) adm-bridge sudah memanggil
+/// `AllowSetForegroundWindow(ASFW_ANY)` dari proses yang dijalankan browser
+/// (jalur resmi), (2) tempel input-thread foreground + nolkan
+/// foreground-lock-timeout, (3) angkat sesaat ke topmost lalu lepas agar
+/// jendela paling tidak tampil di atas browser. Bila SEMUA gagal, kedipkan
+/// taskbar terus-menerus supaya user sadar ada konfirmasi menunggu.
+pub(crate) unsafe fn force_foreground(hwnd: HWND) {
     let fg = GetForegroundWindow();
+    if fg == hwnd {
+        return;
+    }
     let cur = GetCurrentThreadId();
     let other = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
     let attached = other != 0 && other != cur && AttachThreadInput(cur, other, true).as_bool();
+
+    // Nolkan sementara ForegroundLockTimeout (hanya berhasil bila kita sudah
+    // "boleh" jadi foreground; abaikan errornya bila tidak).
+    let mut old_timeout: u32 = 0;
+    let got_timeout = SystemParametersInfoW(
+        SPI_GETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(&mut old_timeout as *mut u32 as *mut core::ffi::c_void),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_ok();
+    if got_timeout && old_timeout != 0 {
+        let _ = SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(std::ptr::null_mut()),
+            SPIF_SENDCHANGE,
+        );
+    }
+
+    // Naik ke atas z-order dulu: meski fokus ditolak, jendela tetap terlihat.
+    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
     let _ = SetActiveWindow(hwnd);
+    let _ = SetFocus(Some(hwnd));
+    // Selalu lepas topmost lagi: kalau tidak, jendela utama bisa terkunci di
+    // atas aplikasi lain selamanya saat Windows menolak perpindahan fokus.
+    // Dialog yang memang perlu tetap di atas memasang TOPMOST-nya sendiri
+    // setelah memanggil fungsi ini.
+    let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+    if got_timeout && old_timeout != 0 {
+        let _ = SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(old_timeout as usize as *mut core::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
     if attached {
         let _ = AttachThreadInput(cur, other, false);
     }
+
+    if GetForegroundWindow() != hwnd {
+        flash_until_focused(hwnd);
+    }
+}
+
+/// Kedipkan tombol taskbar + caption sampai jendela di-klik user (fallback
+/// terakhir bila Windows menolak perpindahan foreground).
+pub(crate) unsafe fn flash_until_focused(hwnd: HWND) {
+    let fi = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    let _ = FlashWindowEx(&fi);
 }
 
 fn toggle_window(hwnd: HWND) {

@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -202,8 +203,15 @@ fn dialog_impl(
         let y = area.top + ((area.bottom - area.top) - dh) / 2;
 
         let title = if with_filename { w!("Download File Info") } else { w!("Add new download") };
+        // Dipicu browser (with_filename) → TOPMOST: konfirmasi ini harus
+        // terlihat di atas jendela browser, bukan sekadar mengedip di taskbar.
+        let ex_style = if with_filename {
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST
+        } else {
+            WS_EX_DLGMODALFRAME
+        };
         let dlg = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            ex_style,
             CLASS,
             title,
             style,
@@ -300,7 +308,17 @@ fn dialog_impl(
         crate::dark::apply(dlg);
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
-        let _ = SetForegroundWindow(dlg);
+        // Rebut foreground beneran (browser sedang aktif saat dipicu ekstensi);
+        // fallback-nya mengedipkan taskbar sampai user melihat.
+        crate::gui::force_foreground(dlg);
+        if with_filename {
+            // force_foreground melepas topmost begitu fokus didapat; untuk
+            // dialog konfirmasi dari browser tahan tetap di atas sampai
+            // dijawab, dan taruh kursor di tombol default.
+            let _ = SetWindowPos(dlg, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            let _ = SetFocus(Some(GetDlgItem(Some(dlg), IDOK as i32).unwrap_or(dlg)));
+            let _ = MessageBeep(MB_ICONASTERISK);
+        }
 
         // Loop modal.
         let _modal = crate::state::ModalGuard::new();

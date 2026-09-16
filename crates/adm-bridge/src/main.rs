@@ -78,9 +78,27 @@ async fn handle(msg: serde_json::Value) -> serde_json::Value {
         return serde_json::json!({ "ok": false, "error": "adm-app tak bisa dijalankan" });
     }
 
+    // Beri izin adm-app merebut foreground. Ini jalur RESMI Windows: proses
+    // ini dijalankan oleh browser (proses foreground), jadi boleh mendelegasikan
+    // haknya. Tanpa ini dialog "Download File Info" cuma mengedipkan taskbar.
+    allow_foreground();
+
     match request(method::DOWNLOAD_ADD, Some(serde_json::to_value(&params).unwrap())).await {
         Ok(resp) => serde_json::json!({ "ok": resp.error.is_none(), "result": resp.result }),
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// `AllowSetForegroundWindow(ASFW_ANY)` — lihat pemanggilnya di `handle`.
+/// Dideklarasikan manual agar adm-bridge tetap tanpa dependensi `windows`.
+fn allow_foreground() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn AllowSetForegroundWindow(dwProcessId: u32) -> i32;
+    }
+    const ASFW_ANY: u32 = u32::MAX;
+    unsafe {
+        AllowSetForegroundWindow(ASFW_ANY);
     }
 }
 
