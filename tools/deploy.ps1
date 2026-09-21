@@ -19,6 +19,19 @@ if ($Build) {
     finally { Pop-Location }
 }
 
+# Salin dengan retry: Windows kadang masih memegang handle image beberapa ratus
+# milidetik setelah prosesnya mati, jadi Copy-Item tepat sesudah Stop-Process
+# bisa gagal "file in use" padahal prosesnya sudah tidak ada.
+function Copy-WithRetry($from, $to) {
+    for ($i = 1; $i -le 20; $i++) {
+        try { Copy-Item $from $to -Force; return }
+        catch {
+            if ($i -eq 20) { throw }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+
 foreach ($exe in "adm-app.exe", "adm-bridge.exe") {
     if (-not (Test-Path (Join-Path $src $exe))) {
         throw "$exe tidak ditemukan di $src - jalankan 'cargo build --release' dulu (atau pakai -Build)."
@@ -38,7 +51,7 @@ foreach ($name in "adm-app", "adm-bridge") {
 
 # Exe hasil build: selalu disalin.
 foreach ($exe in "adm-app.exe", "adm-bridge.exe") {
-    Copy-Item (Join-Path $src $exe) (Join-Path $dst $exe) -Force
+    Copy-WithRetry (Join-Path $src $exe) (Join-Path $dst $exe)
     Write-Host "Disalin: $exe"
 }
 
@@ -48,7 +61,7 @@ foreach ($sc in "deno.exe", "ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe") {
     $d = Join-Path $dst $sc
     if (Test-Path $s) {
         if (-not (Test-Path $d) -or (Get-Item $s).LastWriteTime -ne (Get-Item $d).LastWriteTime) {
-            Copy-Item $s $d -Force
+            Copy-WithRetry $s $d
             Write-Host "Disalin: $sc"
         }
     } elseif (-not (Test-Path $d)) {
