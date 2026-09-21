@@ -10,6 +10,7 @@
 mod download;
 mod error;
 mod grabber;
+pub mod hostcap;
 mod limiter;
 mod platform;
 mod probe;

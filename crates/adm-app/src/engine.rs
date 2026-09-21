@@ -9,7 +9,7 @@ use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome, Progres
 use adm_ipc::DownloadAddParams;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
@@ -28,6 +28,17 @@ fn error_chain<E: std::error::Error>(e: &E) -> String {
         src = s.source();
     }
     msg
+}
+
+/// Pesan kegagalan untuk baris daftar. Bila server membalas status, kodenya
+/// dipasang sebagai tag di depan (`HTTP 403: ...`) supaya GUI bisa memutuskan
+/// "link kedaluwarsa" dari kode, bukan dari mencari angka di dalam teks —
+/// pesan error juga memuat jumlah byte yang bisa kebetulan mengandung "404".
+fn failure_text(e: &adm_core::Error) -> String {
+    match e.status_code() {
+        Some(code) => format!("HTTP {code}: {}", error_chain(e)),
+        None => error_chain(e),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +86,13 @@ pub struct EngineHandle {
     queue: Arc<Mutex<QueueState>>,
     /// Limiter global (dibagi semua unduhan); live-adjustable.
     global_limiter: Arc<Limiter>,
+    /// Jumlah koneksi (segmen) per unduhan; berlaku untuk sesi berikutnya.
+    connections: Arc<AtomicUsize>,
+    /// Kunci per-id: dipegang satu sesi unduhan selama ia menulis berkas &
+    /// sidecar. Sesi baru untuk id yang sama menunggu di sini, jadi sesi lama
+    /// yang baru saja dibatalkan tak sempat menimpa sidecar milik sesi baru
+    /// dengan rencana segmennya yang sudah basi.
+    session_locks: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
     /// Batas kecepatan per-unduhan yang diinginkan user: id → (bps, remember).
     /// Diterapkan ulang saat sesi baru dimulai (limiter dibuat per-sesi, tanpa
     /// map ini limit hilang setiap pause→resume dan no-op untuk paused/queued).
@@ -98,6 +116,8 @@ impl EngineHandle {
                 running_ids: HashSet::new(),
             })),
             global_limiter: Arc::new(Limiter::unlimited()),
+            connections: Arc::new(AtomicUsize::new(8)),
+            session_locks: Arc::new(Mutex::new(HashMap::new())),
             per_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -132,6 +152,20 @@ impl EngineHandle {
     /// Buang batas per-unduhan (dipanggil saat baris dihapus dari daftar).
     pub fn clear_limit(&self, id: u64) {
         self.per_limits.lock().unwrap().remove(&id);
+        // Sekalian lepas kunci sesinya agar map tak tumbuh tanpa batas
+        // sepanjang umur aplikasi (sesi yang masih jalan tetap memegang
+        // Arc-nya sendiri, jadi pelepasan ini aman).
+        self.session_locks.lock().unwrap().remove(&id);
+    }
+
+    /// Kunci sesi untuk `id` (dibuat saat pertama dipakai).
+    fn session_lock(&self, id: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.session_locks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .clone()
     }
 
     pub fn download_dir(&self) -> PathBuf {
@@ -157,6 +191,17 @@ impl EngineHandle {
         self.next_id.fetch_max(min_next, Ordering::SeqCst);
     }
 
+    /// Jumlah koneksi (segmen) per unduhan, di-clamp ke [1, 32]. Berlaku untuk
+    /// unduhan/sesi yang dimulai setelahnya — segmentasi sesi berjalan sudah
+    /// terkunci di sidecar-nya.
+    pub fn set_connections(&self, n: usize) {
+        self.connections.store(n.clamp(1, 32), Ordering::SeqCst);
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
     /// Batas unduhan antrian yang berjalan bersamaan.
     pub fn set_queue_max(&self, max: usize) {
         self.queue.lock().unwrap().max = max.max(1);
@@ -177,6 +222,27 @@ impl EngineHandle {
         };
         if was_pending && !self.active.lock().unwrap().contains_key(&id) {
             (self.sink)(EngineEvent::Paused { id, downloaded: 0 });
+        }
+    }
+
+    /// Batalkan lalu TUNGGU sampai sesi `id` benar-benar berhenti (maks
+    /// `timeout`). Wajib dipakai sebelum aksi destruktif pada berkasnya
+    /// (Redownload, Delete with file): `cancel` hanya memberi sinyal, dan task
+    /// yang masih hidup bisa menulis ulang berkas + sidecar yang baru saja
+    /// dihapus — hasilnya berkas berlubang yang tetap dilaporkan "Complete".
+    /// Mengembalikan false bila sampai timeout masih berjalan (pemanggil tetap
+    /// lanjut; itu kondisi terburuk yang sama dengan perilaku lama).
+    pub fn cancel_sync(&self, id: u64, timeout: std::time::Duration) -> bool {
+        self.cancel(id);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.active.lock().unwrap().contains_key(&id) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -381,6 +447,7 @@ impl EngineHandle {
 
         let this = self.clone();
         let global_limiter = self.global_limiter.clone();
+        let session_lock = self.session_lock(id);
         self.handle.spawn(async move {
             // Tentukan nama berkas (Content-Disposition bila nama generik/absen).
             let name = this.resolve_filename(&params, id).await;
@@ -396,12 +463,21 @@ impl EngineHandle {
             let req = DownloadRequest {
                 url: params.url.clone(),
                 output,
-                connections: 8,
+                connections: this.connections.load(Ordering::SeqCst),
                 insecure: params.insecure,
                 referrer: params.referrer.clone(),
                 user_agent: params.user_agent.clone(),
                 cookies: params.cookies.clone(),
             };
+            // Tunggu sesi sebelumnya untuk id ini benar-benar melepas berkasnya.
+            // Dibatasi waktu: kalau sesi lama macet, lebih baik tetap jalan
+            // (perilaku lama) daripada baris menggantung tanpa penjelasan.
+            let _guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                session_lock.lock(),
+            )
+            .await
+            .ok();
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
             let owns_entry = {
                 // Hapus entri hanya bila masih milik sesi ini — sesi baru bisa
@@ -426,7 +502,7 @@ impl EngineHandle {
                 let ev = match res {
                     Ok(Outcome::Completed { bytes }) => EngineEvent::Completed { id, bytes },
                     Ok(Outcome::Paused { downloaded, .. }) => EngineEvent::Paused { id, downloaded },
-                    Err(e) => EngineEvent::Failed { id, error: error_chain(&e) },
+                    Err(e) => EngineEvent::Failed { id, error: failure_text(&e) },
                 };
                 (this.sink)(ev);
             }

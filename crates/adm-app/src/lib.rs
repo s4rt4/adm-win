@@ -83,6 +83,7 @@ pub fn run() {
     let engine = engine::EngineHandle::new(rt.handle().clone(), dl_dir, gui::make_sink());
     engine.set_queue_max(cfg.queue_max.max(1));
     engine.set_global_limit(cfg.global_limit_kbps.saturating_mul(1024));
+    engine.set_connections(cfg.connections);
     autostart::sync(cfg.autostart);
     // Pulihkan daftar unduhan yang persist; setel id engine agar tak bentrok.
     let max_id = store::load();

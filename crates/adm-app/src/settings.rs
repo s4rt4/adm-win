@@ -16,6 +16,9 @@ pub struct Settings {
     pub queue_max: usize,
     /// batas kecepatan global (KB/s; 0 = tanpa batas).
     pub global_limit_kbps: u64,
+    /// jumlah koneksi (segmen) per unduhan. Host tertentu membatasi koneksi
+    /// paralel per IP dan memutus yang berlebih — turunkan bila sering gagal.
+    pub connections: usize,
     /// jalankan saat login.
     pub autostart: bool,
     /// bahasa UI ("en" / "id").
@@ -35,6 +38,7 @@ impl Default for Settings {
             download_dir: None,
             queue_max: 1,
             global_limit_kbps: 0,
+            connections: 8,
             autostart: false,
             language: "en".into(),
             show_complete_dialog: true,

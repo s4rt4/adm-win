@@ -4,28 +4,53 @@
 use crate::error::{Error, Result};
 use crate::limiter::Limiter;
 use crate::sidecar::{self, SegRecord, Sidecar};
-use crate::{platform, probe};
+use crate::{hostcap, platform, probe};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, RANGE, REFERER};
 use reqwest::Client;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Token pembatalan (pause/stop). Shared antar task.
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<CancelInner>);
+
+#[derive(Default)]
+struct CancelInner {
+    flag: AtomicBool,
+    /// Membangunkan penunggu seketika. Tanpa ini, Stop baru terasa saat chunk
+    /// berikutnya tiba — pada koneksi yang sudah mati itu berarti menunggu
+    /// sampai `READ_TIMEOUT` (30 detik) sebelum baris berhenti.
+    notify: tokio::sync::Notify,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.flag.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.flag.load(Ordering::SeqCst)
+    }
+    /// Selesai begitu token dibatalkan (langsung bila sudah dibatalkan).
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Daftar DULU, baru periksa flag: dengan urutan sebaliknya, cancel
+            // yang jatuh di antara periksa dan daftar akan terlewat dan
+            // penunggu menggantung selamanya.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -99,6 +124,103 @@ pub struct ReqHeaders {
     pub cookies: Option<String>,
 }
 
+/// Batas percobaan satu segmen sebelum unduhan dinyatakan gagal. Gangguan
+/// sesaat (koneksi di-reset host, TLS putus, body terpotong) adalah penyebab
+/// kegagalan paling umum pada berkas besar atau host ber-rate-limit; tanpa
+/// retry satu hiccup di salah satu koneksi menggagalkan SELURUH unduhan
+/// padahal link-nya masih sehat (persis kasus "Resume langsung jalan lagi").
+const MAX_ATTEMPTS: u32 = 5;
+/// Percobaan jalur satu-koneksi non-resumable — tiap ulangan mulai dari nol,
+/// jadi sengaja lebih sedikit daripada segmen yang bisa melanjutkan.
+const SINGLE_ATTEMPTS: u32 = 3;
+/// Percobaan probe awal (deteksi ukuran & dukungan Range).
+const PROBE_ATTEMPTS: u32 = 3;
+/// Berapa banyak retry dalam SATU unduhan yang dianggap "host ini menolak
+/// koneksi paralel sebanyak itu" — batas koneksi host lalu diturunkan.
+const RETRY_PENALTY_THRESHOLD: u32 = 3;
+/// Jeda dasar backoff eksponensial: 2s, 4s, 8s, 16s.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Status HTTP yang pantas dicoba ulang (sibuk/sementara), bukan penolakan
+/// permanen. 401/403/404/410 sengaja TIDAK di sini: itu link yang benar-benar
+/// kedaluwarsa — user harus cepat diarahkan ke Refresh Link, bukan menunggu
+/// lima percobaan sia-sia.
+fn retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Rantai pesan error (termasuk seluruh `source()`) dalam huruf kecil.
+fn chain_lower(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(x) = src {
+        s.push(' ');
+        s.push_str(&x.to_string());
+        src = x.source();
+    }
+    s.to_ascii_lowercase()
+}
+
+/// Masalah sertifikat: mengulanginya lima kali tidak akan membuat sertifikat
+/// jadi sah — hanya menunda dialog "terima risiko" setengah menit. Perlakukan
+/// sebagai permanen agar user langsung ditawari pilihan.
+fn is_cert_error(e: &Error) -> bool {
+    let m = chain_lower(e);
+    m.contains("certificate")
+        || m.contains("unknownissuer")
+        || m.contains("notvalidfor")
+        || m.contains("certexpired")
+        || m.contains("badsignature")
+}
+
+/// Apakah error ini gangguan sesaat yang layak dicoba ulang.
+fn is_transient(e: &Error) -> bool {
+    if is_cert_error(e) {
+        return false;
+    }
+    match e {
+        // Error reqwest tanpa status = level transport (timeout, connect
+        // refused, koneksi di-reset, body/decode terputus) — hampir selalu
+        // sesaat. Dengan status → ikuti tabel di atas.
+        Error::Http(re) => re.status().map(|s| retryable_status(s.as_u16())).unwrap_or(true),
+        Error::BadStatus(code) => retryable_status(*code),
+        Error::Truncated { .. } => true,
+        Error::RangeIgnored(_)
+        | Error::UnknownSize
+        | Error::Io(_)
+        | Error::Json(_)
+        | Error::Other(_) => false,
+    }
+}
+
+/// Tidur `d`, tapi bangun seketika bila user menekan Pause/Stop selama backoff.
+async fn sleep_cancellable(d: Duration, cancel: &CancelToken) {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => {}
+        _ = cancel.cancelled() => {}
+    }
+}
+
+/// Probe dengan retry — kegagalan pertama sering cuma hiccup TCP/TLS, dan
+/// kalau ia lolos ke pemanggil unduhan gagal sebelum satu byte pun terkirim.
+async fn probe_with_retry(client: &Client, url: &str, cancel: &CancelToken) -> Result<probe::Probe> {
+    let mut attempt = 1u32;
+    loop {
+        match probe::probe(client, url).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                if cancel.is_cancelled() || attempt >= PROBE_ATTEMPTS || !is_transient(&e) {
+                    return Err(e);
+                }
+                sleep_cancellable(RETRY_BASE_DELAY * attempt, cancel).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
     let ua = h
         .user_agent
@@ -108,7 +230,14 @@ fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
         .user_agent(ua)
         // Jangan simpan koneksi idle (probe singkat tak meninggalkan keep-alive
         // yang menggantung; tiap segmen pakai koneksi sendiri).
-        .pool_max_idle_per_host(0);
+        .pool_max_idle_per_host(0)
+        // Tanpa timeout (default reqwest) koneksi yang "mati diam" — host
+        // berhenti mengirim tanpa menutup socket — menggantung selamanya.
+        // Dengan timeout ia jadi error transien yang langsung dicoba ulang.
+        // Catatan: read_timeout hanya berjalan saat body sedang di-poll, jadi
+        // jeda akibat limiter kecepatan tidak ikut terhitung.
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT);
     let mut headers = HeaderMap::new();
     if let Some(r) = &h.referrer {
         if let Ok(v) = HeaderValue::from_str(r) {
@@ -197,7 +326,7 @@ pub async fn download(
         cookies: req.cookies.clone(),
     };
     let client = build_client(req.insecure, &headers)?;
-    let pr = probe::probe(&client, &req.url).await?;
+    let pr = probe_with_retry(&client, &req.url, &cancel).await?;
     sidecar::migrate_legacy(&req.output); // lokasi lama `<file>.adm` → folder state
     let sidecar_path = sidecar::path_for(&req.output);
 
@@ -210,7 +339,14 @@ pub async fn download(
     }
 
     let total = pr.total.ok_or(Error::UnknownSize)?;
-    let conns = req.connections.clamp(1, 64);
+    let wanted = req.connections.clamp(1, 64);
+    // Host yang sebelumnya memutus koneksi berlebih dipakai dengan segmen lebih
+    // sedikit (lihat modul `hostcap`); setelan user tetap jadi batas atas.
+    let host = hostcap::host_of(&req.url);
+    let conns = match &host {
+        Some(h) => hostcap::effective(h, wanted),
+        None => wanted,
+    };
 
     // Resume bila sidecar cocok; selain itu rencana segar. Sidecar hanya
     // dipercaya bila (a) file output masih ada dengan ukuran pre-alokasi penuh
@@ -282,7 +418,9 @@ pub async fn download(
         on_progress.clone(),
     );
 
-    // Task per segmen.
+    // Task per segmen. `retries` menghitung berapa kali koneksi harus diulang
+    // — sinyal untuk menurunkan/menaikkan batas koneksi host.
+    let retries = Arc::new(AtomicU32::new(0));
     let mut handles = Vec::with_capacity(segments.len());
     for seg in &segments {
         let h = tokio::spawn(run_segment(
@@ -294,6 +432,7 @@ pub async fn download(
             global_limiter.clone(),
             cancel.clone(),
             global.clone(),
+            retries.clone(),
         ));
         handles.push(h);
     }
@@ -316,6 +455,21 @@ pub async fn download(
     let _ = reporter.await;
     write_sidecar(&sidecar_path, &req, &pr, total, &segments);
 
+    // Umpan balik batas koneksi adaptif: sesi yang dibatalkan user tidak
+    // dihitung (retry-nya bukan cerminan perilaku host).
+    if let Some(h) = &host {
+        if !cancel.is_cancelled() {
+            let n = retries.load(Ordering::Relaxed);
+            let used = segments.len();
+            let fatal_transient = first_err.as_ref().is_some_and(is_transient);
+            if used > 1 && (fatal_transient || n >= RETRY_PENALTY_THRESHOLD) {
+                hostcap::penalize(h, used);
+            } else if first_err.is_none() && n == 0 {
+                hostcap::reward(h, wanted);
+            }
+        }
+    }
+
     if cancel.is_cancelled() {
         let dl = global.load(Ordering::Relaxed);
         return Ok(Outcome::Paused {
@@ -324,6 +478,22 @@ pub async fn download(
         });
     }
     if let Some(e) = first_err {
+        // Probe bilang Range didukung, tapi saat segmen non-awal diminta server
+        // membalas body penuh. Satu-satunya cara aman: unduh sekuensial satu
+        // koneksi dari awal (jalur ini menulis ulang berkas dari nol).
+        if matches!(e, Error::RangeIgnored(_)) && segments.len() > 1 {
+            sidecar::remove(&sidecar_path);
+            return download_single(
+                &client,
+                &req,
+                cancel,
+                on_progress,
+                Some(total),
+                per_limiter,
+                global_limiter,
+            )
+            .await;
+        }
         return Err(e);
     }
 
@@ -369,6 +539,9 @@ fn plan_segments(total: u64, conns: usize) -> Vec<Arc<SegState>> {
     segs
 }
 
+/// Satu segmen, dengan retry. Tiap percobaan menghitung ulang titik mulai dari
+/// `seg.downloaded`, jadi byte yang sudah tertulis tidak diunduh ulang — retry
+/// di sini setara "Resume otomatis" untuk satu koneksi saja.
 #[allow(clippy::too_many_arguments)]
 async fn run_segment(
     client: Client,
@@ -379,6 +552,51 @@ async fn run_segment(
     global_limiter: Arc<Limiter>,
     cancel: CancelToken,
     global: Arc<AtomicU64>,
+    retries: Arc<AtomicU32>,
+) -> Result<()> {
+    for attempt in 1..=MAX_ATTEMPTS {
+        match run_segment_once(
+            &client,
+            &url,
+            &seg,
+            &output,
+            &per_limiter,
+            &global_limiter,
+            &cancel,
+            &global,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Pause/Stop bukan kegagalan: jangan retry, jangan lapor error.
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                if attempt == MAX_ATTEMPTS || !is_transient(&e) {
+                    return Err(e);
+                }
+                retries.fetch_add(1, Ordering::Relaxed);
+                sleep_cancellable(RETRY_BASE_DELAY * (1u32 << (attempt - 1)), &cancel).await;
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_segment_once(
+    client: &Client,
+    url: &str,
+    seg: &SegState,
+    output: &std::path::Path,
+    per_limiter: &Limiter,
+    global_limiter: &Limiter,
+    cancel: &CancelToken,
+    global: &AtomicU64,
 ) -> Result<()> {
     let begin = seg.start + seg.downloaded.load(Ordering::Relaxed);
     if begin > seg.end {
@@ -387,7 +605,7 @@ async fn run_segment(
 
     let range = format!("bytes={}-{}", begin, seg.end);
     let resp = client
-        .get(&url)
+        .get(url)
         .header(RANGE, range)
         .send()
         .await?
@@ -396,21 +614,24 @@ async fn run_segment(
     // Segmen non-awal WAJIB dapat 206 Partial Content. Bila server mengabaikan
     // Range dan membalas 200 (body penuh dari byte 0), menulisnya di offset
     // segmen akan MERUSAK berkas — gagalkan dengan jelas, jangan korup.
+    // Pemanggil menangkap error ini dan jatuh ke jalur satu-koneksi.
     if begin > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(Error::Other(format!(
-            "server mengabaikan Range (status {}); unduhan multi-segmen dibatalkan",
-            resp.status().as_u16()
-        )));
+        return Err(Error::RangeIgnored(resp.status().as_u16()));
     }
 
-    let file = platform::open_writer(&output)?;
+    let file = platform::open_writer(output)?;
     let mut offset = begin;
     let mut stream = resp.bytes_stream();
 
-    while let Some(item) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
+    loop {
+        // `biased`: cancel selalu dicek lebih dulu agar Stop tidak kalah cepat
+        // dari data yang masih mengalir deras.
+        let item = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            it = stream.next() => it,
+        };
+        let Some(item) = item else { break };
         let chunk = item?;
         // Jangan melampaui akhir segmen (server bisa abaikan batas Range).
         let allowed = (seg.end + 1 - offset) as usize;
@@ -433,10 +654,22 @@ async fn run_segment(
             break;
         }
     }
+    // Stream habis sebelum segmen penuh. Body chunked yang ditutup "rapi" di
+    // tengah jalan tidak dianggap error oleh hyper — tanpa cek ini segmen
+    // dilaporkan sukses, unduhan berakhir "Stopped" di 90-an persen, dan tidak
+    // ada yang mencoba ulang. Laporkan transien agar retry mengambil alih.
+    if !cancel.is_cancelled() && offset <= seg.end {
+        return Err(Error::Truncated {
+            got: offset - seg.start,
+            want: seg.len(),
+        });
+    }
     Ok(())
 }
 
-/// Jalur satu-koneksi tanpa resume (server tanpa Range / ukuran tak diketahui).
+/// Jalur satu-koneksi tanpa resume, dengan retry. Karena server tak mendukung
+/// Range, tiap percobaan terpaksa mulai dari nol — tetap jauh lebih baik
+/// daripada menyerah pada hiccup pertama.
 #[allow(clippy::too_many_arguments)]
 async fn download_single(
     client: &Client,
@@ -446,6 +679,46 @@ async fn download_single(
     total: Option<u64>,
     per_limiter: Arc<Limiter>,
     global_limiter: Arc<Limiter>,
+) -> Result<Outcome> {
+    for attempt in 1..=SINGLE_ATTEMPTS {
+        match download_single_once(
+            client,
+            req,
+            &cancel,
+            &on_progress,
+            total,
+            &per_limiter,
+            &global_limiter,
+        )
+        .await
+        {
+            Ok(o) => return Ok(o),
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return Ok(Outcome::Paused { downloaded: 0, total });
+                }
+                if attempt == SINGLE_ATTEMPTS || !is_transient(&e) {
+                    return Err(e);
+                }
+                sleep_cancellable(RETRY_BASE_DELAY * attempt, &cancel).await;
+                if cancel.is_cancelled() {
+                    return Ok(Outcome::Paused { downloaded: 0, total });
+                }
+            }
+        }
+    }
+    Ok(Outcome::Paused { downloaded: 0, total })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_single_once(
+    client: &Client,
+    req: &DownloadRequest,
+    cancel: &CancelToken,
+    on_progress: &Option<ProgressCb>,
+    total: Option<u64>,
+    per_limiter: &Limiter,
+    global_limiter: &Limiter,
 ) -> Result<Outcome> {
     use std::io::Write;
 
@@ -464,16 +737,19 @@ async fn download_single(
     let mut stream = resp.bytes_stream();
     let mut downloaded = 0u64;
 
-    while let Some(item) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Ok(Outcome::Paused { downloaded, total });
-        }
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(Outcome::Paused { downloaded, total }),
+            it = stream.next() => it,
+        };
+        let Some(item) = item else { break };
         let chunk = item?;
         per_limiter.acquire(chunk.len()).await;
         global_limiter.acquire(chunk.len()).await;
         file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
-        if let Some(cb) = &on_progress {
+        if let Some(cb) = on_progress {
             cb(Progress {
                 downloaded,
                 total,
@@ -491,9 +767,10 @@ async fn download_single(
     // transfer/content-encoding bisa lebih besar dari Content-Length.)
     if let Some(t) = total {
         if downloaded < t {
-            return Err(Error::Other(format!(
-                "body terputus: {downloaded} dari {t} byte"
-            )));
+            return Err(Error::Truncated {
+                got: downloaded,
+                want: t,
+            });
         }
     }
     Ok(Outcome::Completed { bytes: downloaded })
@@ -571,4 +848,70 @@ fn write_sidecar(
             .collect(),
     };
     let _ = sidecar::save(path, &sc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_selesai_seketika_bila_sudah_dibatalkan() {
+        let c = CancelToken::new();
+        c.cancel();
+        tokio::time::timeout(Duration::from_secs(1), c.cancelled())
+            .await
+            .expect("token yang sudah dibatalkan tak boleh menunggu");
+    }
+
+    /// Regresi: `notified()` harus didaftarkan SEBELUM flag diperiksa.
+    /// Dengan urutan terbalik, cancel yang jatuh tepat di antara keduanya
+    /// hilang dan penunggu menggantung selamanya.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_bangun_dari_task_lain() {
+        let c = CancelToken::new();
+        let c2 = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.cancel();
+        });
+        tokio::time::timeout(Duration::from_secs(2), c.cancelled())
+            .await
+            .expect("penunggu harus dibangunkan oleh cancel()");
+    }
+
+    /// Stop saat backoff tidak boleh menunggu sisa jeda sampai habis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_putus_saat_cancel() {
+        let c = CancelToken::new();
+        let c2 = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.cancel();
+        });
+        let t0 = std::time::Instant::now();
+        sleep_cancellable(Duration::from_secs(30), &c).await;
+        assert!(t0.elapsed() < Duration::from_secs(2), "backoff harus putus: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn klasifikasi_error() {
+        // Sibuk/sementara → diulang.
+        assert!(is_transient(&Error::BadStatus(503)));
+        assert!(is_transient(&Error::BadStatus(429)));
+        assert!(is_transient(&Error::Truncated { got: 1, want: 2 }));
+        // Penolakan permanen → jangan buang waktu, user butuh link baru.
+        assert!(!is_transient(&Error::BadStatus(403)));
+        assert!(!is_transient(&Error::BadStatus(404)));
+        assert!(!is_transient(&Error::RangeIgnored(200)));
+        assert!(!is_transient(&Error::UnknownSize));
+    }
+
+    /// Regresi: retry membuat dialog "sertifikat tidak tepercaya" tertunda
+    /// setengah menit. Masalah sertifikat tidak akan sembuh dengan diulang.
+    #[test]
+    fn error_sertifikat_tidak_diulang() {
+        let e = Error::Other("invalid peer certificate: UnknownIssuer".into());
+        assert!(is_cert_error(&e));
+        assert!(!is_transient(&e));
+    }
 }
