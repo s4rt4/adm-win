@@ -136,6 +136,14 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
         r.category = category;
         r.status = Status::Downloading;
         r.failed_announced = false; // mulai lagi → kegagalan berikutnya diumumkan
+        // Idem untuk penyelesaian. Tanpa reset ini, baris yang dipulihkan dari
+        // disk (load() menandai SEMUA baris lama "sudah diumumkan" agar tidak
+        // memunculkan popup basi saat startup) tidak pernah memicu dialog
+        // "Download complete" saat di-Resume — dan karena dialog progresnya
+        // ditutup di jalur yang sama, ia menggantung di 100% dengan tombol
+        // Resume/Cancel. Sama halnya untuk unduhan yang dijalankan ulang
+        // (Redownload) di sesi yang sama.
+        r.complete_announced = false;
         r.last_error = None;
     } else {
         rows.push(Row {
@@ -426,4 +434,44 @@ pub fn load() -> u64 {
     }
     *ROWS.lock().unwrap() = rows;
     max_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_by(id: u64) -> Row {
+        get(id).expect("baris harus ada")
+    }
+
+    /// Unduhan yang dijalankan ulang (Resume/Redownload) harus memicu dialog
+    /// "Download complete" lagi. Dulu `complete_announced` hanya pernah
+    /// di-set true dan tak pernah di-reset, jadi baris yang dipulihkan dari
+    /// disk (load() menandai semuanya "sudah diumumkan") menggantung di 100%
+    /// tanpa dialog dan dialog progresnya tak pernah tertutup.
+    #[test]
+    fn restart_mengumumkan_penyelesaian_lagi() {
+        let id = 9_000_001;
+        let out = PathBuf::from("C:/tmp/uji-announce.bin");
+
+        // Sesi pertama: mulai -> selesai -> diumumkan.
+        on_started(id, "http://contoh/uji.bin".into(), out.clone());
+        set_status(id, Status::Complete);
+        assert!(
+            take_newly_completed().iter().any(|r| r.id == id),
+            "penyelesaian pertama harus diumumkan"
+        );
+        assert!(row_by(id).complete_announced);
+
+        // Sesi kedua (mis. Resume setelah restart app): harus diumumkan lagi.
+        on_started(id, "http://contoh/uji.bin".into(), out);
+        assert!(!row_by(id).complete_announced, "mulai ulang harus mereset flag");
+        set_status(id, Status::Complete);
+        assert!(
+            take_newly_completed().iter().any(|r| r.id == id),
+            "penyelesaian setelah mulai ulang harus diumumkan"
+        );
+
+        remove(id);
+    }
 }
