@@ -1092,6 +1092,8 @@ unsafe fn refresh_list(lv: HWND) {
         set_subitem(lv, idx, 3, &status_text(r));
         set_subitem(lv, idx, 4, &fmt_eta(r.eta_secs()));
         set_subitem(lv, idx, 5, &fmt_speed(r.speed_bps));
+        // Description: sebab kegagalan terakhir (kosong untuk baris sehat).
+        set_subitem(lv, idx, 7, &description_text(r));
     }
     if rebuild && (!sel_before.is_empty() || focus_before.is_some()) {
         for (i, r) in visible.iter().enumerate() {
@@ -1124,6 +1126,17 @@ fn sort_rows(rows: &mut [store::Row], col: i32) {
         4 => rows.sort_by_key(|r| r.eta_secs().unwrap_or(u64::MAX)),
         5 => rows.sort_by_key(|r| r.speed_bps),
         _ => {}
+    }
+}
+
+/// Teks kolom Description: sebab kegagalan terakhir, dipadatkan satu baris.
+fn description_text(r: &store::Row) -> String {
+    if r.status != store::Status::Error {
+        return String::new();
+    }
+    match &r.last_error {
+        Some(e) => short_error(&e.replace(['\n', '\r'], " ")),
+        None => String::new(),
     }
 }
 
@@ -1911,6 +1924,42 @@ unsafe fn do_refresh_link(hwnd: HWND, id: u64) {
     }
 }
 
+/// Apakah error menandakan link ditolak permanen oleh server (kedaluwarsa),
+/// bukan sekadar koneksi putus. Untuk status ini engine sengaja menyerah cepat
+/// tanpa retry, jadi Refresh Link memang tindakan yang tepat.
+fn looks_expired(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    // Engine memasang tag "HTTP <kode>: " di depan bila server membalas
+    // status (lihat engine::failure_text). Kode dibaca dari tag itu saja —
+    // mencari "404" di mana pun dalam teks salah, karena pesan juga memuat
+    // jumlah byte ("koneksi terputus: 40412 dari ... byte").
+    if let Some(rest) = m.strip_prefix("http ") {
+        if let Some(code) = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|c| c.parse::<u16>().ok())
+        {
+            return matches!(code, 401 | 403 | 404 | 410);
+        }
+    }
+    // Sumber tanpa tag (mis. pesan yt-dlp): jatuh ke kata kuncinya.
+    m.contains("forbidden") || m.contains("not found") || m.contains("410 gone")
+}
+
+/// Potong pesan error panjang (rantai source bisa berlapis) agar MessageBox
+/// dan kolom Description tetap terbaca.
+fn short_error(msg: &str) -> String {
+    let m = msg.trim();
+    if m.is_empty() {
+        return "tidak diketahui".into();
+    }
+    let mut out: String = m.chars().take(240).collect();
+    if m.chars().count() > 240 {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Apakah pesan error menandakan masalah sertifikat TLS.
 fn is_tls_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
@@ -1957,9 +2006,19 @@ unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
         }
         return;
     }
+    // Sebab aslinya WAJIB ikut: engine sudah mencoba ulang beberapa kali
+    // sebelum sampai sini, jadi "link kedaluwarsa" cuma salah satu kemungkinan
+    // - menyembunyikan pesan error membuat user salah diagnosa.
+    let saran = if looks_expired(&err) {
+        "Server menolak link ini - kemungkinan besar link sudah kedaluwarsa. Buka tautan asli, salin link baru, lalu masukkan di sini. Unduhan akan dilanjutkan dari posisi terakhir."
+    } else {
+        "Koneksi terputus dan percobaan ulang otomatis sudah habis. Coba Resume; bila tetap gagal, ambil link baru dari tautan asli (unduhan tetap dilanjutkan dari posisi terakhir). Bila host sering memutus koneksi, turunkan Connections per download di Options."
+    };
     let msg = HSTRING::from(format!(
-        "Download gagal:\n{}\n\nLink mungkin sudah kedaluwarsa. Buka tautan asli, salin link baru, lalu masukkan di sini. Unduhan akan dilanjutkan dari posisi terakhir.\n\nRefresh link sekarang?",
-        row.filename()
+        "Download gagal:\n{}\n\nPenyebab: {}\n\n{}\n\nRefresh link sekarang?",
+        row.filename(),
+        short_error(&err),
+        saran
     ));
     let r = MessageBoxW(
         Some(hwnd),
@@ -1985,7 +2044,10 @@ unsafe fn do_redownload(hwnd: HWND) {
     }
     let Some(row) = store::get(id) else { return };
     let Some(e) = ENGINE.get() else { return };
-    e.cancel(id); // no-op bila tidak aktif
+    // Tunggu sesi lama benar-benar mati sebelum berkasnya dihapus — kalau
+    // tidak, task yang masih hidup menulis lagi ke path yang sama dan unduhan
+    // baru mewarisi berkas berlubang.
+    e.cancel_sync(id, std::time::Duration::from_secs(3));
     let _ = std::fs::remove_file(&row.output);
     adm_core::sidecar::remove_for(&row.output);
     // Baris YouTube → restart via yt-dlp (bukan engine HTTP).
@@ -2029,7 +2091,12 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
     // Hapus per-id (bukan per-index) agar pergeseran indeks tak mengganggu.
     for id in ids {
         if let Some(e) = engine {
-            e.cancel(id);
+            if delete_file {
+                // Idem `do_redownload`: jangan hapus berkas selagi task menulis.
+                e.cancel_sync(id, std::time::Duration::from_secs(3));
+            } else {
+                e.cancel(id);
+            }
             e.clear_limit(id); // batas per-unduhan ikut hangus
         }
         // Baris playlist → hentikan & lepas manajernya (+ tutup jendela progres).
@@ -3251,5 +3318,39 @@ fn on_completion_power(action: crate::progress::WhenDone) {
             }
             WhenDone::Exit => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{looks_expired, short_error};
+
+    #[test]
+    fn kedaluwarsa_dibaca_dari_tag_status() {
+        assert!(looks_expired("HTTP 403: status http tak terduga: 403"));
+        assert!(looks_expired("HTTP 404: ..."));
+        assert!(!looks_expired("HTTP 503: server sibuk"));
+    }
+
+    #[test]
+    fn jumlah_byte_bukan_kode_status() {
+        // Regresi: dulu substring "404" di jumlah byte bikin ADM menyuruh
+        // user me-refresh link padahal yang putus cuma koneksi.
+        assert!(!looks_expired("koneksi terputus: 40412 dari 90000 byte"));
+        assert!(!looks_expired("error sending request for url (http://x/404.bin)"));
+    }
+
+    #[test]
+    fn tanpa_tag_pakai_kata_kunci() {
+        assert!(looks_expired("ERROR: unable to download: HTTP Error Forbidden"));
+        assert!(!looks_expired("connection reset by peer"));
+    }
+
+    #[test]
+    fn short_error_memotong_dan_menangani_kosong() {
+        assert_eq!(short_error("   "), "tidak diketahui");
+        let panjang = "x".repeat(400);
+        let out = short_error(&panjang);
+        assert!(out.len() <= 243 && out.ends_with("..."));
     }
 }

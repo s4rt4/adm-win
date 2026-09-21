@@ -79,11 +79,8 @@ static COMPLETION_OPTS: Mutex<Vec<(u64, CompletionOpts)>> = Mutex::new(Vec::new(
 /// Ambil & hapus opsi penyelesaian untuk `id` (dipanggil saat unduhan selesai).
 pub fn take_completion_opts(id: u64) -> Option<CompletionOpts> {
     let mut m = COMPLETION_OPTS.lock().unwrap();
-    if let Some(pos) = m.iter().position(|(i, _)| *i == id) {
-        Some(m.swap_remove(pos).1)
-    } else {
-        None
-    }
+    let pos = m.iter().position(|(i, _)| *i == id)?;
+    Some(m.swap_remove(pos).1)
 }
 
 fn set_completion_opts(id: u64, opts: CompletionOpts) {
