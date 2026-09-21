@@ -44,7 +44,9 @@ static ABOUT_REG: AtomicBool = AtomicBool::new(false);
 static ABOUT_DONE: AtomicBool = AtomicBool::new(false);
 static ABOUT_ICON: Mutex<isize> = Mutex::new(0);
 static ABOUT_LINK: Mutex<isize> = Mutex::new(0);
-const ABOUT_VERSION: &str = "0.1.0";
+/// Versi yang ditampilkan dialog About — diambil dari Cargo.toml agar tak
+/// pernah melenceng dari versi biner/installer yang sebenarnya.
+const ABOUT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ABOUT_CLASS: PCWSTR = w!("AdmAboutDialog");
 const IDC_ABOUT_OK: usize = 1;
 const IDC_ABOUT_LINK: usize = 2;
