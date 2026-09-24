@@ -453,8 +453,7 @@ fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                         // pertama hilang. Antrikan; di-flush saat dialog tutup.
                         PENDING_ADDS.lock().unwrap().push(params);
                     } else {
-                        show_window(hwnd); // munculkan dari tray bila perlu
-                        show_add(hwnd, Some(params));
+                        show_add(hwnd, Some(params)); // jendela utama tetap di tray
                         flush_pending_adds(hwnd);
                     }
                 }
@@ -2368,7 +2367,6 @@ unsafe fn flush_pending_adds(hwnd: HWND) {
         if q.is_empty() { None } else { Some(q.remove(0)) }
     };
     if let Some(params) = next {
-        show_window(hwnd);
         show_add(hwnd, Some(params));
         flush_pending_adds(hwnd);
     }

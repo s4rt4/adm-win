@@ -31,6 +31,13 @@ const IDC_OC_COMBO: usize = 15; // When done: (Shut down/Hibernate/Sleep/Exit)
 const TIMER_ID: usize = 1;
 const ANIM_TIMER: usize = 2;
 
+/// Style dialog progres. WS_MINIMIZEBOX memberi tombol minimize;
+/// WS_EX_APPWINDOW menjamin tombol taskbar sendiri. Dialog dibuat TANPA owner
+/// (seperti IDM): owned window menyeret jendela utama ke depan saat aktif dan
+/// ikut ter-minimize/tersembunyi bersamanya.
+const PROGRESS_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+const PROGRESS_EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_DLGMODALFRAME.0 | WS_EX_APPWINDOW.0);
+
 /// Registry dialog progres terbuka (id → HWND) untuk auto-tutup saat selesai.
 static OPEN_DIALOGS: Mutex<Vec<(u64, isize)>> = Mutex::new(Vec::new());
 
@@ -238,7 +245,7 @@ pub fn open(parent: HWND, id: u64) {
         if let Some(h) = existing {
             let hwnd = HWND(h as *mut core::ffi::c_void);
             if IsWindow(Some(hwnd)).as_bool() {
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
                 let _ = SetForegroundWindow(hwnd);
                 return;
             }
@@ -254,19 +261,22 @@ pub fn open(parent: HWND, id: u64) {
             .unwrap_or_else(|| "Download".into());
         let htitle = HSTRING::from(title);
 
-        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let mut rcsz = RECT { left: 0, top: 0, right: 560, bottom: 470 };
-        let _ = AdjustWindowRectEx(&mut rcsz, style, false, WS_EX_DLGMODALFRAME);
+        let _ = AdjustWindowRectEx(&mut rcsz, PROGRESS_STYLE, false, PROGRESS_EX_STYLE);
+        let (dw, dh) = (rcsz.right - rcsz.left, rcsz.bottom - rcsz.top);
+
+        let (x, y) = center_on_monitor(parent, dw, dh);
+
         let dlg = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            PROGRESS_EX_STYLE,
             PROGRESS_CLASS,
             PCWSTR(htitle.as_ptr()),
-            style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rcsz.right - rcsz.left,
-            rcsz.bottom - rcsz.top,
-            Some(parent),
+            PROGRESS_STYLE,
+            x,
+            y,
+            dw,
+            dh,
+            None, // tanpa owner — lihat PROGRESS_EX_STYLE
             None,
             Some(instance),
             None,
@@ -449,6 +459,21 @@ pub fn open(parent: HWND, id: u64) {
     }
 }
 
+/// Posisi kiri-atas agar jendela `dw`×`dh` berada di tengah area kerja
+/// monitor `anchor` (bukan rect-nya — jendela utama bisa minimized/di tray).
+unsafe fn center_on_monitor(anchor: HWND, dw: i32, dh: i32) -> (i32, i32) {
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let mon = MonitorFromWindow(anchor, MONITOR_DEFAULTTOPRIMARY);
+    let area = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+        mi.rcWork
+    } else {
+        RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+    };
+    let x = area.left + ((area.right - area.left) - dw) / 2;
+    let y = area.top + ((area.bottom - area.top) - dh) / 2;
+    (x.max(area.left), y.max(area.top))
+}
+
 unsafe fn data_of(hwnd: HWND) -> Option<&'static mut DlgData> {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgData;
     if ptr.is_null() {
@@ -489,9 +514,8 @@ unsafe fn toggle_details(hwnd: HWND) {
     let _ = MoveWindow(d.btn_pause, 330, btn_y, 100, 28, true);
     let _ = MoveWindow(d.btn_cancel, 440, btn_y, 100, 28, true);
 
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     let mut rc = RECT { left: 0, top: 0, right: 560, bottom: client_h };
-    let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+    let _ = AdjustWindowRectEx(&mut rc, PROGRESS_STYLE, false, PROGRESS_EX_STYLE);
     let _ = SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
 }
 
@@ -939,18 +963,17 @@ pub fn show_complete(parent: HWND, row: &Row) {
         let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
         let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
 
-        let mut pr = RECT::default();
-        let _ = GetWindowRect(parent, &mut pr);
-        let x = (pr.left + ((pr.right - pr.left) - dw) / 2).max(0);
-        let y = (pr.top + ((pr.bottom - pr.top) - dh) / 2).max(0);
+        let (x, y) = center_on_monitor(parent, dw, dh);
 
+        // Tanpa owner (lihat PROGRESS_EX_STYLE): jangan menyeret jendela utama
+        // yang sedang di tray ke depan.
         let dlg = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
             CMPL_CLASS,
             w!("Download complete"),
             style,
             x, y, dw, dh,
-            Some(parent),
+            None,
             None,
             Some(instance),
             None,
@@ -1019,7 +1042,9 @@ pub fn show_complete(parent: HWND, row: &Row) {
         }
 
         let _ = EnableWindow(parent, true);
-        let _ = SetForegroundWindow(parent);
+        if IsWindowVisible(parent).as_bool() {
+            let _ = SetForegroundWindow(parent);
+        }
         if IsWindow(Some(dlg)).as_bool() {
             let _ = DestroyWindow(dlg);
         }

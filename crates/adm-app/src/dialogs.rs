@@ -219,7 +219,9 @@ fn dialog_impl(
             y.max(0),
             dw,
             dh,
-            Some(parent),
+            // Dari browser: tanpa owner, agar jendela utama tetap di tray dan
+            // tidak terseret muncul di belakang dialog.
+            if with_filename { None } else { Some(parent) },
             None,
             Some(instance),
             None,
@@ -335,7 +337,9 @@ fn dialog_impl(
         }
 
         let _ = EnableWindow(parent, true);
-        let _ = SetForegroundWindow(parent);
+        if IsWindowVisible(parent).as_bool() {
+            let _ = SetForegroundWindow(parent);
+        }
         if IsWindow(Some(dlg)).as_bool() {
             let _ = DestroyWindow(dlg);
         }
