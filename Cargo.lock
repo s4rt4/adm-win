@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adm-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adm-core",
  "adm-ipc",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "adm-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adm-ipc",
  "serde_json",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "adm-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "adm-ipc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
