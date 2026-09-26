@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, RANGE, REFERER};
 use reqwest::Client;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,6 +192,67 @@ fn is_transient(e: &Error) -> bool {
         | Error::Io(_)
         | Error::Json(_)
         | Error::Other(_) => false,
+    }
+}
+
+/// Server menolak koneksi ini (401/403) — di probe berarti link mati, tapi di
+/// tengah unduhan multi-koneksi sering berarti "koneksi paralel kebanyakan".
+fn is_rejection(e: &Error) -> bool {
+    let code = match e {
+        Error::Http(re) => re.status().map(|s| s.as_u16()),
+        Error::BadStatus(c) => Some(*c),
+        _ => None,
+    };
+    matches!(code, Some(401 | 403))
+}
+
+/// Koordinasi antar segmen satu unduhan: berapa yang sedang memegang koneksi,
+/// dan sinyal tiap kali salah satunya keluar (selesai atau gagal).
+///
+/// Host seperti pixeldrain menjawab 403 — bukan 429 — untuk koneksi paralel
+/// yang melebihi jatah per-IP, padahal link-nya sehat (probe barusan lolos,
+/// segmen lain masih mengalir). Menganggapnya "link kedaluwarsa" menggagalkan
+/// seluruh unduhan; Resume lalu langsung tuntas karena tinggal satu-dua segmen
+/// yang tersisa. Segmen yang ditolak sebaiknya mengalah: tunggu sampai
+/// koneksi lain lepas, lalu coba lagi.
+struct Crew {
+    active: AtomicUsize,
+    exited: tokio::sync::Notify,
+}
+
+impl Crew {
+    fn new(n: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(n),
+            exited: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Segmen ini selesai/gagal — bangunkan yang sedang mengalah.
+    fn leave(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.exited.notify_waiters();
+    }
+
+    /// Mengalah setelah ditolak: lepas slot, tunggu segmen lain keluar, ambil
+    /// slot lagi. `false` bila tak ada segmen lain yang aktif — penolakan itu
+    /// berarti link memang ditolak, bukan soal jatah koneksi.
+    async fn yield_slot(&self, cancel: &CancelToken) -> bool {
+        let exited = self.exited.notified();
+        tokio::pin!(exited);
+        // Daftar sebagai penunggu SEBELUM melepas slot, agar keluarnya segmen
+        // lain di antara dua langkah ini tidak terlewat.
+        exited.as_mut().enable();
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        tokio::select! {
+            _ = exited => {}
+            _ = cancel.cancelled() => {}
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        true
     }
 }
 
@@ -421,6 +482,8 @@ pub async fn download(
     // Task per segmen. `retries` menghitung berapa kali koneksi harus diulang
     // — sinyal untuk menurunkan/menaikkan batas koneksi host.
     let retries = Arc::new(AtomicU32::new(0));
+    let rejected = Arc::new(AtomicU32::new(0));
+    let crew = Arc::new(Crew::new(segments.len()));
     let mut handles = Vec::with_capacity(segments.len());
     for seg in &segments {
         let h = tokio::spawn(run_segment(
@@ -433,6 +496,8 @@ pub async fn download(
             cancel.clone(),
             global.clone(),
             retries.clone(),
+            rejected.clone(),
+            crew.clone(),
         ));
         handles.push(h);
     }
@@ -462,7 +527,9 @@ pub async fn download(
             let n = retries.load(Ordering::Relaxed);
             let used = segments.len();
             let fatal_transient = first_err.as_ref().is_some_and(is_transient);
-            if used > 1 && (fatal_transient || n >= RETRY_PENALTY_THRESHOLD) {
+            // Satu penolakan saja sudah bukti jelas batas koneksi host terlampaui.
+            let was_rejected = rejected.load(Ordering::Relaxed) > 0;
+            if used > 1 && (fatal_transient || was_rejected || n >= RETRY_PENALTY_THRESHOLD) {
                 hostcap::penalize(h, used);
             } else if first_err.is_none() && n == 0 {
                 hostcap::reward(h, wanted);
@@ -553,34 +620,72 @@ async fn run_segment(
     cancel: CancelToken,
     global: Arc<AtomicU64>,
     retries: Arc<AtomicU32>,
+    rejected: Arc<AtomicU32>,
+    crew: Arc<Crew>,
 ) -> Result<()> {
-    for attempt in 1..=MAX_ATTEMPTS {
-        match run_segment_once(
-            &client,
-            &url,
-            &seg,
-            &output,
-            &per_limiter,
-            &global_limiter,
-            &cancel,
-            &global,
-        )
-        .await
-        {
+    let res = run_segment_retrying(
+        &client,
+        &url,
+        &seg,
+        &output,
+        &per_limiter,
+        &global_limiter,
+        &cancel,
+        &global,
+        &retries,
+        &rejected,
+        &crew,
+    )
+    .await;
+    crew.leave();
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_segment_retrying(
+    client: &Client,
+    url: &str,
+    seg: &SegState,
+    output: &std::path::Path,
+    per_limiter: &Limiter,
+    global_limiter: &Limiter,
+    cancel: &CancelToken,
+    global: &AtomicU64,
+    retries: &AtomicU32,
+    rejected: &AtomicU32,
+    crew: &Crew,
+) -> Result<()> {
+    let mut attempt = 1u32;
+    while attempt <= MAX_ATTEMPTS {
+        match run_segment_once(client, url, seg, output, per_limiter, global_limiter, cancel, global).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 // Pause/Stop bukan kegagalan: jangan retry, jangan lapor error.
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
+                // Ditolak saat segmen lain masih jalan: jatah koneksi host
+                // habis. Tunggu giliran — tak memakan jatah percobaan, karena
+                // tiap tunggu butuh segmen lain keluar (jumlahnya terbatas).
+                if is_rejection(&e) {
+                    if !crew.yield_slot(cancel).await {
+                        return Err(e);
+                    }
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 if attempt == MAX_ATTEMPTS || !is_transient(&e) {
                     return Err(e);
                 }
                 retries.fetch_add(1, Ordering::Relaxed);
-                sleep_cancellable(RETRY_BASE_DELAY * (1u32 << (attempt - 1)), &cancel).await;
+                sleep_cancellable(RETRY_BASE_DELAY * (1u32 << (attempt - 1)), cancel).await;
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
+                attempt += 1;
             }
         }
     }

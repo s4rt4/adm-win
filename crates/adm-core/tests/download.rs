@@ -1,7 +1,8 @@
 //! Test integrasi engine (kriteria WM1): multi-koneksi + checksum, resume
 //! setelah cancel (mensimulasikan stop/crash), fallback non-Range, retry
-//! otomatis saat host memutus body di tengah, dan gagal-cepat untuk status
-//! permanen (403) yang memang berarti link kedaluwarsa.
+//! otomatis saat host memutus body di tengah, gagal-cepat untuk status
+//! permanen (403) yang memang berarti link kedaluwarsa, dan mengalah (bukan
+//! gagal) saat host menolak koneksi paralel berlebih dengan 403.
 
 use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,11 @@ static FLAKY_LEFT: AtomicUsize = AtomicUsize::new(0);
 
 /// Alamat loopback khusus test flaky (lihat `start_server_at`).
 const FLAKY_HOST: &str = "127.0.0.2";
+
+/// Koneksi Range besar yang sedang dilayani path `limited`, dan batasnya.
+static LIMITED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const LIMITED_MAX: usize = 2;
+const LIMITED_HOST: &str = "127.0.0.3";
 
 fn unlimited() -> Arc<Limiter> {
     Arc::new(Limiter::unlimited())
@@ -128,6 +134,18 @@ fn handle(req: tiny_http::Request, payload: &[u8]) {
             {
                 b = a + (b - a) / 2;
             }
+            // Host berbatas koneksi (meniru pixeldrain): koneksi ke-3 dst.
+            // ditolak 403 selama dua lainnya masih mengalir.
+            let mut held = false;
+            if req.url().contains("limited") && b - a > 1024 {
+                if LIMITED_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= LIMITED_MAX {
+                    LIMITED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    let _ = req.respond(Response::from_data(Vec::new()).with_status_code(StatusCode(403)));
+                    return;
+                }
+                held = true;
+                std::thread::sleep(Duration::from_millis(150));
+            }
             let slice = payload[a as usize..=b as usize].to_vec();
             let cr = format!("bytes {}-{}/{}", a, b, total);
             let resp = Response::from_data(slice)
@@ -136,6 +154,9 @@ fn handle(req: tiny_http::Request, payload: &[u8]) {
                 .with_header(Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap())
                 .with_header(etag_header);
             let _ = req.respond(resp);
+            if held {
+                LIMITED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         None => {
             let resp = Response::from_data(payload.to_vec())
@@ -345,6 +366,33 @@ async fn permanent_status_fails_fast() {
         "403 tak boleh menunggu backoff retry: {:?}",
         t0.elapsed()
     );
+}
+
+/// 403 di tengah unduhan saat segmen lain masih jalan = jatah koneksi host
+/// habis, bukan link mati: segmen yang ditolak harus menunggu giliran dan
+/// unduhan tetap tuntas utuh, lalu batas koneksi host diturunkan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_limit_403_waits_instead_of_failing() {
+    let payload = Arc::new(make_payload(1024 * 1024));
+    let (base, _srv) = start_server_at(LIMITED_HOST, payload.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("limited.bin");
+
+    let req = DownloadRequest {
+        url: format!("{base}/limited.bin"),
+        output: out.clone(),
+        connections: 8,
+        insecure: false,
+        referrer: None,
+        user_agent: None,
+        cookies: None,
+    };
+    let outcome = download(req, CancelToken::new(), None, unlimited(), unlimited())
+        .await
+        .expect("403 karena batas koneksi tak boleh menggagalkan unduhan");
+    assert!(matches!(outcome, Outcome::Completed { .. }));
+    assert_eq!(sha256(&read_file(&out)), sha256(&payload), "checksum harus cocok");
+    assert_eq!(adm_core::hostcap::current(LIMITED_HOST), Some(4), "8 koneksi ditolak => separuh");
 }
 
 fn adm_core_sidecar_exists(output: &std::path::Path) -> bool {
