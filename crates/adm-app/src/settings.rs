@@ -29,6 +29,31 @@ pub struct Settings {
     pub youtube_ytdlp: Option<String>,
     /// path ffmpeg.exe (None = auto: folder aplikasi → PATH).
     pub youtube_ffmpeg: Option<String>,
+    /// suara notifikasi per event (Options → Sounds...).
+    pub sounds: Sounds,
+}
+
+/// Setelan suara satu event. `file` None/kosong = suara bawaan (embedded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundPref {
+    pub enabled: bool,
+    pub file: Option<String>,
+}
+
+impl Default for SoundPref {
+    fn default() -> Self {
+        Self { enabled: true, file: None }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sounds {
+    pub complete: SoundPref,
+    pub queue_done: SoundPref,
+    pub failed: SoundPref,
+    pub captured: SoundPref,
 }
 
 impl Default for Settings {
@@ -44,6 +69,7 @@ impl Default for Settings {
             show_complete_dialog: true,
             youtube_ytdlp: None,
             youtube_ffmpeg: None,
+            sounds: Sounds::default(),
         }
     }
 }

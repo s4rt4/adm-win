@@ -113,6 +113,15 @@ pub fn id_at(index: usize) -> Option<u64> {
     ROWS.lock().unwrap().get(index).map(|r| r.id)
 }
 
+/// Unduhan yang masih berjalan atau menunggu giliran (0 = antrean kosong).
+pub fn pending_count() -> usize {
+    ROWS.lock()
+        .unwrap()
+        .iter()
+        .filter(|r| matches!(r.status, Status::Downloading | Status::Queued))
+        .count()
+}
+
 pub fn active_count() -> usize {
     ROWS.lock()
         .unwrap()

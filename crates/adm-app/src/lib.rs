@@ -15,6 +15,8 @@ pub mod progress;
 pub mod scheduler;
 pub mod settings;
 pub mod single_instance;
+pub mod sound;
+pub mod sound_options;
 pub mod state;
 pub mod store;
 pub mod tasks;

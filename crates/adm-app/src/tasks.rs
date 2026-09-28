@@ -778,10 +778,20 @@ pub fn save_dialog(parent: HWND) -> Option<PathBuf> {
 
 /// Pilih berkas executable (mis. yt-dlp.exe / ffmpeg.exe) untuk Options.
 pub fn pick_exe(parent: HWND, title: &str) -> Option<PathBuf> {
+    pick_file(parent, title, &["Executable (*.exe)", "*.exe", "All files (*.*)", "*.*"])
+}
+
+/// Pilih file suara notifikasi (Options → Sounds...).
+pub fn pick_sound(parent: HWND, title: &str) -> Option<PathBuf> {
+    pick_file(parent, title, &["Sound (*.wav;*.mp3)", "*.wav;*.mp3", "All files (*.*)", "*.*"])
+}
+
+/// `filter`: pasangan (deskripsi, pola) bergantian, seperti lpstrFilter.
+fn pick_file(parent: HWND, title: &str, filter_parts: &[&str]) -> Option<PathBuf> {
     unsafe {
         let mut buf = [0u16; 1024];
         let mut filter: Vec<u16> = Vec::new();
-        for part in ["Executable (*.exe)", "*.exe", "All files (*.*)", "*.*"] {
+        for part in filter_parts {
             filter.extend(part.encode_utf16());
             filter.push(0);
         }

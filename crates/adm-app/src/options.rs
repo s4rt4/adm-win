@@ -41,6 +41,7 @@ const ID_CONNS: usize = 7;
 const ID_BROWSE: usize = 10;
 const ID_BROWSE_YTDLP: usize = 11;
 const ID_BROWSE_FFMPEG: usize = 12;
+const ID_SOUNDS: usize = 13;
 const ID_OK: usize = 20;
 const ID_CANCEL: usize = 21;
 
@@ -193,6 +194,9 @@ pub fn show(parent: HWND) {
         let _ = mk(dlg, w!("BUTTON"), w!("Browse..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), M + FW - 80, 301, 80, EH + 2, ID_BROWSE_FFMPEG);
         set_ctrl(5, ff);
 
+        // Sub-dialog suara notifikasi (kiri bawah).
+        let _ = mk(dlg, w!("BUTTON"), w!("Sounds..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), M, 338, 90, 30, ID_SOUNDS);
+
         // Tombol (rata kanan di tepi bawah area klien).
         let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 264, 338, 84, 30, ID_OK);
         let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 356, 338, 84, 30, ID_CANCEL);
@@ -280,6 +284,7 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                             set_text(ctrl(4), &p.to_string_lossy());
                         }
                     }
+                    ID_SOUNDS => crate::sound_options::show(hwnd),
                     ID_BROWSE_FFMPEG => {
                         if let Some(p) = crate::tasks::pick_exe(hwnd, "Pilih ffmpeg.exe") {
                             set_text(ctrl(5), &p.to_string_lossy());

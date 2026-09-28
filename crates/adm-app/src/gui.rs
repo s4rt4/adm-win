@@ -1987,7 +1987,7 @@ unsafe fn do_download_insecure(hwnd: HWND, id: u64) {
 
 /// Popup saat unduhan gagal. Bila error sertifikat TLS → tawarkan unduh dengan
 /// "terima risiko"; selain itu → tawarkan Refresh Link (link kedaluwarsa dll).
-unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
+unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row, quiet: bool) {
     // MessageBox memompa pesan → tunda popup completion lain selama terbuka.
     let _modal = state::ModalGuard::new();
     let err = row.last_error.clone().unwrap_or_default();
@@ -1996,12 +1996,7 @@ unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
             "Download gagal (masalah sertifikat SSL):\n{}\n\nSertifikat server tidak tepercaya/invalid. Anda bisa tetap mengunduh dengan mengabaikan verifikasi sertifikat (risiko keamanan Anda yang tanggung).\n\nUnduh tetap (terima risiko)?",
             row.filename()
         ));
-        let r = MessageBoxW(
-            Some(hwnd),
-            PCWSTR(msg.as_ptr()),
-            w!("SSL certificate problem"),
-            MB_YESNO | MB_ICONWARNING,
-        );
+        let r = warning_yes_no(hwnd, &msg, w!("SSL certificate problem"), quiet);
         if r == IDYES {
             do_download_insecure(hwnd, row.id);
         }
@@ -2021,15 +2016,30 @@ unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
         short_error(&err),
         saran
     ));
-    let r = MessageBoxW(
-        Some(hwnd),
-        PCWSTR(msg.as_ptr()),
-        w!("Download failed"),
-        MB_YESNO | MB_ICONWARNING,
-    );
+    let r = warning_yes_no(hwnd, &msg, w!("Download failed"), quiet);
     if r == IDYES {
         do_refresh_link(hwnd, row.id);
     }
+}
+
+/// MessageBox Yes/No berikon peringatan. `quiet`: suara notifikasi ADM sudah
+/// diputar — MB_ICONWARNING selalu membunyikan suara "Exclamation" Windows,
+/// jadi ikon yang sama dipasang lewat MB_USERICON (tanpa suara sistem).
+unsafe fn warning_yes_no(hwnd: HWND, text: &HSTRING, caption: PCWSTR, quiet: bool) -> MESSAGEBOX_RESULT {
+    if !quiet {
+        return MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), caption, MB_YESNO | MB_ICONWARNING);
+    }
+    let params = MSGBOXPARAMSW {
+        cbSize: std::mem::size_of::<MSGBOXPARAMSW>() as u32,
+        hwndOwner: hwnd,
+        lpszText: PCWSTR(text.as_ptr()),
+        lpszCaption: caption,
+        dwStyle: MB_YESNO | MB_USERICON,
+        // hInstance null + IDI_* = ikon bawaan sistem.
+        lpszIcon: IDI_WARNING,
+        ..Default::default()
+    };
+    MessageBoxIndirectW(&params)
 }
 
 /// Redownload: unduh ulang item terpilih dari awal — hentikan bila aktif,
@@ -2300,6 +2310,12 @@ unsafe fn refresh_ui(hwnd: HWND) {
             if completed.is_empty() && failed.is_empty() {
                 break;
             }
+            // Satu suara per batch, diputar SEBELUM dialog modal di bawah
+            // (dialog complete memblokir sampai ditutup). Bila suara custom
+            // diputar, balon/MessageBox dibungkam agar tak bunyi dobel.
+            let played = crate::sound::notify_batch(completed.len(), failed.len(), store::pending_count() == 0);
+            let quiet_failed = played == Some(crate::sound::Event::Failed);
+            let quiet_balloon = played.is_some();
             for row in completed {
                 let opts = crate::progress::take_completion_opts(row.id);
                 crate::progress::close_for(row.id); // unduhan selesai → tutup dialog status
@@ -2310,7 +2326,7 @@ unsafe fn refresh_ui(hwnd: HWND) {
                 if show_complete || opts.map(|o| o.show_dialog).unwrap_or(false) {
                     crate::progress::show_complete(hwnd, &row);
                 } else {
-                    notify_balloon(hwnd, "Download selesai", &row.filename());
+                    notify_balloon(hwnd, "Download selesai", &row.filename(), quiet_balloon);
                 }
                 if let Some(o) = opts {
                     if o.exit_app {
@@ -2327,7 +2343,7 @@ unsafe fn refresh_ui(hwnd: HWND) {
                 // selesai lewat resume, jauh setelah user lupa.
                 let _ = crate::progress::take_completion_opts(row.id);
                 crate::progress::close_for(row.id); // mis. link kedaluwarsa → tawarkan Refresh Link
-                show_failed_popup(hwnd, &row);
+                show_failed_popup(hwnd, &row, quiet_failed);
             }
         }
         // (IN_POPUP dilepas oleh PopupGuard di akhir blok — panik-aman.)
@@ -3227,13 +3243,13 @@ fn add_tray_icon(hwnd: HWND) {
 }
 
 /// Notifikasi balon Windows lewat ikon tray (toast non-modal, mis. saat selesai).
-fn notify_balloon(hwnd: HWND, title: &str, body: &str) {
+fn notify_balloon(hwnd: HWND, title: &str, body: &str, quiet: bool) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_UID,
         uFlags: NIF_INFO,
-        dwInfoFlags: NIIF_INFO,
+        dwInfoFlags: if quiet { NIIF_INFO | NIIF_NOSOUND } else { NIIF_INFO },
         ..Default::default()
     };
     let t: Vec<u16> = title.encode_utf16().collect();

@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::Shell::*;
@@ -319,7 +318,7 @@ fn dialog_impl(
             // dijawab, dan taruh kursor di tombol default.
             let _ = SetWindowPos(dlg, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetFocus(Some(GetDlgItem(Some(dlg), IDOK as i32).unwrap_or(dlg)));
-            let _ = MessageBeep(MB_ICONASTERISK);
+            crate::sound::play(crate::sound::Event::Captured);
         }
 
         // Loop modal.
