@@ -69,6 +69,15 @@ foreach ($sc in "deno.exe", "ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe") {
     }
 }
 
+# Extension: Chrome/Edge memuat unpacked dari AppData\ADM\extension, jadi folder
+# itu harus ikut diperbarui (dulu tertinggal di 0.1.0). Perlu Reload di
+# chrome://extensions agar perubahannya terbaca.
+$extSrc = Join-Path $repo "extension"
+$extDst = Join-Path $dst "extension"
+if (-not (Test-Path $extDst)) { New-Item -ItemType Directory -Force $extDst | Out-Null }
+Copy-Item (Join-Path $extSrc "*") $extDst -Recurse -Force
+Write-Host "Disalin: extension (Reload di chrome://extensions)"
+
 # Register ulang native messaging host DARI exe produksi, supaya manifest + registry
 # menunjuk ke AppData (bukan target\release yang bisa kena cargo clean).
 Write-Host "== register native host =="
