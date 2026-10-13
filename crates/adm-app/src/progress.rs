@@ -1023,7 +1023,10 @@ pub fn show_complete(parent: HWND, row: &Row) {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
-        let _modal = crate::state::ModalGuard::new();
+        // Sengaja TANPA ModalGuard: dialog ini cuma pemberitahuan, jadi
+        // unduhan baru dari browser harus tetap memunculkan dialog Add (nested
+        // di loop ini) alih-alih dititipkan sampai dialog ini ditutup.
+        // Popup completion lain tetap tak bertumpuk berkat IN_POPUP di refresh_ui.
         let mut msg = MSG::default();
         while !CMPL_DONE.load(Ordering::SeqCst) {
             if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
