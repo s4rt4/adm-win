@@ -289,6 +289,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
                 | ICC_PROGRESS_CLASS,
         };
         let _ = InitCommonControlsEx(&icc);
+        crate::youtube::spawn_auto_update();
 
         let class_name = w!("AdmMainWindow");
         let wc = WNDCLASSW {

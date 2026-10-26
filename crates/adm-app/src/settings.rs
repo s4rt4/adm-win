@@ -80,7 +80,7 @@ pub const THEME_DARK: u8 = 2;
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("ADM")
 }

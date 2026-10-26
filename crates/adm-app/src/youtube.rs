@@ -179,6 +179,49 @@ pub fn missing_tooltip() -> String {
     }
 }
 
+// ============================ Auto-update yt-dlp ============================
+
+/// Jeda minimum antar-cek update (detik).
+const UPDATE_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Perbarui yt-dlp (`yt-dlp -U`) di thread latar, paling sering sekali per
+/// hari. YouTube rutin mengubah player/client (mis. eksperimen SABR-only,
+/// client android_vr → UNPLAYABLE); yt-dlp yang tertinggal beberapa bulan
+/// berakhir dengan "This video is not available" untuk SEMUA video walau
+/// deno tersedia. Hanya biner bawaan di folder aplikasi yang disentuh —
+/// yt-dlp milik user (Options/PATH, mis. via pip) dibiarkan.
+pub fn spawn_auto_update() {
+    let Some(ytdlp) = ytdlp_path() else { return };
+    if ytdlp.parent() != app_dir().as_deref() {
+        return;
+    }
+    let stamp = settings::dir().join("ytdlp-update.stamp");
+    let fresh = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < UPDATE_INTERVAL_SECS);
+    if fresh {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut cmd = Command::new(&ytdlp);
+        cmd.arg("-U");
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        tool_env(&mut cmd, &ytdlp);
+        // Stamp hanya bila sukses — offline/gagal dicoba lagi saat start berikutnya.
+        if output_with_job(cmd).is_ok_and(|o| o.status.success()) {
+            let _ = std::fs::create_dir_all(settings::dir());
+            // Isi berubah tiap tulis agar mtime pasti diperbarui.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = std::fs::write(&stamp, now.to_string());
+        }
+    });
+}
+
 // ============================ Penyusunan argumen ============================
 
 /// Set env & flag proses yt-dlp: sisipkan folder biner ke PATH (agar `deno`
