@@ -490,6 +490,8 @@ unsafe fn spawn_size_probe(dlg: HWND, url: &str) {
         let headers = PROBE_HEADERS.lock().unwrap().clone().unwrap_or_default();
         let gen = PROBE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         eng.runtime().spawn(async move {
+            // Link halaman (WeTransfer dll) → URL berkas agar ukuran & nama benar.
+            let url = adm_core::resolve_url(&url, &headers, false).await.unwrap_or(url);
             let probe = adm_core::probe_url_with(&url, &headers, false).await.ok();
             let total = probe.as_ref().and_then(|p| p.total).unwrap_or(0);
             let filename = probe.and_then(|p| p.suggested_filename);

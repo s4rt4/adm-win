@@ -282,7 +282,7 @@ async fn probe_with_retry(client: &Client, url: &str, cancel: &CancelToken) -> R
     }
 }
 
-fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
+pub(crate) fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
     let ua = h
         .user_agent
         .clone()

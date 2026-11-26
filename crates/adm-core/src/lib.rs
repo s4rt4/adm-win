@@ -14,6 +14,7 @@ pub mod hostcap;
 mod limiter;
 mod platform;
 mod probe;
+mod resolve;
 pub mod sidecar;
 
 pub use download::{
@@ -24,6 +25,7 @@ pub use error::{Error, Result};
 pub use grabber::{extract_links, grab_links};
 pub use limiter::Limiter;
 pub use probe::{percent_decode, probe, Probe};
+pub use resolve::resolve_url;
 
 /// Versi crate, dipakai a.l. untuk balasan `daemon.ping`.
 pub fn version() -> &'static str {

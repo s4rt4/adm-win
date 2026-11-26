@@ -449,36 +449,51 @@ impl EngineHandle {
         let global_limiter = self.global_limiter.clone();
         let session_lock = self.session_lock(id);
         self.handle.spawn(async move {
-            // Tentukan nama berkas (Content-Disposition bila nama generik/absen).
-            let name = this.resolve_filename(&params, id).await;
-            let mut dir = this.download_dir.lock().unwrap().clone();
-            if let Some(folder) = Category::from_filename(&name).folder() {
-                dir.push(folder);
-            }
-            let output = dir.join(&name);
-
-            // Koreksi nama baris (placeholder Started sudah diemit sinkron).
-            (this.sink)(EngineEvent::Renamed { id, output: output.clone() });
-
-            let req = DownloadRequest {
-                url: params.url.clone(),
-                output,
-                connections: this.connections.load(Ordering::SeqCst),
-                insecure: params.insecure,
+            // Link halaman (mis. WeTransfer) → URL berkas langsung. Diulang tiap
+            // start/Resume karena tokennya kedaluwarsa; baris tetap menyimpan
+            // link halaman aslinya.
+            let page_headers = adm_core::ReqHeaders {
                 referrer: params.referrer.clone(),
                 user_agent: params.user_agent.clone(),
                 cookies: params.cookies.clone(),
             };
-            // Tunggu sesi sebelumnya untuk id ini benar-benar melepas berkasnya.
-            // Dibatasi waktu: kalau sesi lama macet, lebih baik tetap jalan
-            // (perilaku lama) daripada baris menggantung tanpa penjelasan.
-            let _guard = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                session_lock.lock(),
-            )
-            .await
-            .ok();
-            let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
+            let res = match adm_core::resolve_url(&params.url, &page_headers, params.insecure).await {
+                Err(e) => Err(e),
+                Ok(direct) => {
+                    let mut params = params.clone();
+                    params.url = direct;
+                    // Tentukan nama berkas (Content-Disposition bila nama generik/absen).
+                    let name = this.resolve_filename(&params, id).await;
+                    let mut dir = this.download_dir.lock().unwrap().clone();
+                    if let Some(folder) = Category::from_filename(&name).folder() {
+                        dir.push(folder);
+                    }
+                    let output = dir.join(&name);
+
+                    // Koreksi nama baris (placeholder Started sudah diemit sinkron).
+                    (this.sink)(EngineEvent::Renamed { id, output: output.clone() });
+
+                    let req = DownloadRequest {
+                        url: params.url.clone(),
+                        output,
+                        connections: this.connections.load(Ordering::SeqCst),
+                        insecure: params.insecure,
+                        referrer: params.referrer.clone(),
+                        user_agent: params.user_agent.clone(),
+                        cookies: params.cookies.clone(),
+                    };
+                    // Tunggu sesi sebelumnya untuk id ini benar-benar melepas berkasnya.
+                    // Dibatasi waktu: kalau sesi lama macet, lebih baik tetap jalan
+                    // (perilaku lama) daripada baris menggantung tanpa penjelasan.
+                    let _guard = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        session_lock.lock(),
+                    )
+                    .await
+                    .ok();
+                    download(req, cancel, Some(on_progress), per_limiter, global_limiter).await
+                }
+            };
             let owns_entry = {
                 // Hapus entri hanya bila masih milik sesi ini — sesi baru bisa
                 // sudah menggantikan entri id yang sama.
